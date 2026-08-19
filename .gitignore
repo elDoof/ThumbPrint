@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+Packages/
+Package.resolved
+
+# Release artefacts produced by Scripts/release.sh
+/dist/
+
+# Local editor configuration (machine-specific)
+.vscode/
+.idea/
+
+# Test scaffolding from the disk-image testing flow (see docs/DEVELOPMENT.md § Testing).
+# Anchored to the repo root on purpose: unanchored `main.swift` and `harness`
+# patterns match at any depth and would silently exclude Tests/main.swift.
+*.dmg
+/harness
+/main.swift
