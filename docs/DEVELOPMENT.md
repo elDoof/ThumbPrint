@@ -12,7 +12,7 @@ Two modes, chosen per run:
 
 Read this first if you're picking the project up cold.
 
-- **Git:** public at `elDoof/ThumbPrint` on GitHub, branch `main`, MIT licensed. History was squashed to a single commit for the 1.0 public release. No CI; releases are cut by hand with `Scripts/release.sh`.
+- **Git:** public at `elDoof/ThumbPrint` on GitHub, branch `main`, MIT licensed. **1.0 shipped 2026-08-19** — release `v1.0` carries a notarized `ThumbPrint-1.0.dmg`. History was squashed to a single authored commit for the public release and the old repository was deleted and recreated rather than force-pushed, so no earlier object survives on GitHub. The pre-release history exists only on the local branch `archive/pre-public-history`. No CI; releases are cut by hand with `Scripts/release.sh`.
 - **Distribution:** signed with `Developer ID Application: Sascha Nowlin (DPLC4BD7ST)` and notarized under the `djsnowlin@gmail.com` Apple account. The Xcode project stays ad-hoc signed so a fork builds with no certificate; the Developer ID, hardened runtime and secure timestamp are applied only by `Scripts/release.sh`.
 - **Tests:** `./Tests/run.sh` is the suite (124 checks). It builds its own throwaway exFAT volumes and disk images, runs, and cleans up after itself. Run it before and after touching `Model/` or `Services/`.
 - **Built and covered by tests:** Fast Sync, Exact Clone (code only — see below), export-staleness screening, Compare mode, the drive registry, disk image save/restore.
@@ -35,6 +35,28 @@ Read this first if you're picking the project up cold.
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   xcodebuild -project ThumbPrint.xcodeproj -scheme ThumbPrint -configuration Debug build
 ```
+
+### Cutting a release
+
+```bash
+./Scripts/release.sh                # build → sign → notarize → staple → DMG → notarize → staple → verify
+./Scripts/release.sh --no-notarize  # sign and package only, for a local smoke test
+```
+
+Output is `dist/ThumbPrint-<version>.dmg`. Bump `MARKETING_VERSION` in `project.pbxproj` (both configurations) first;
+the script reads the version from the built bundle, so the filename and the DMG volume name follow automatically.
+Then `gh release create v<version> dist/ThumbPrint-<version>.dmg --title "ThumbPrint <version>" --notes-file <file>`.
+
+Notarization needs a keychain profile named `ThumbPrint`, stored once with an app-specific password from
+appleid.apple.com under the `djsnowlin@gmail.com` Apple account:
+
+```bash
+xcrun notarytool store-credentials "ThumbPrint" \
+    --apple-id "djsnowlin@gmail.com" --team-id "DPLC4BD7ST" --password "<app-specific-password>"
+```
+
+`--no-notarize` deliberately skips the Gatekeeper assertion at the end, because `spctl` rejects a Developer ID build
+that has no ticket yet — that is the expected state of that mode, not a failure.
 
 `project.pbxproj` is hand-written (no XcodeGen or Tuist in this project) using **`objectVersion = 77`** with a `PBXFileSystemSynchronizedRootGroup`. The project references the `ThumbPrint/` **directory**, not individual files — so **adding a `.swift` file requires no project edit**. Drop it in and build.
 
@@ -196,13 +218,17 @@ Always `hdiutil detach` and delete the `.dmg` files afterwards.
 ## Signing and permissions
 
 - **App Sandbox is off** and must stay off — raw device I/O and arbitrary volume access are incompatible with it. No Mac App Store; irrelevant for a personal tool.
-- Ad-hoc signed (`CODE_SIGN_IDENTITY = "-"`, no team). Release sets `CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO` to strip the `get-task-allow` debug entitlement.
+- **The Xcode project stays ad-hoc signed** (`CODE_SIGN_IDENTITY = "-"`, no team) on purpose, so a fork clones and builds with no certificate and no Apple account. Release also sets `CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO` to strip the `get-task-allow` debug entitlement.
+- **The shipping identity is applied by `Scripts/release.sh` alone**, never by the project: `Developer ID Application: Sascha Nowlin (DPLC4BD7ST)`, hardened runtime on, secure `--timestamp`. The script re-signs the built app explicitly rather than trusting the build-phase signature, which carries neither reliably, and notarization rejects a build missing either.
+- **Both the app and the disk image are notarized and stapled**, in that order: zip the app → notarize → staple the app → build the DMG from the stapled app → notarize the DMG → staple the DMG. Stapling twice is what makes the download work on a Mac that is offline or behind a filter.
 - `Info.plist` needs **`NSRemovableVolumesUsageDescription`**. Without it macOS is TCC-blocked from removable volumes and the failure presents as an *empty directory listing*, not an error. On first launch the user must click Allow.
 - Exact Clone's privileged script is written to a **0700** dir inside `NSTemporaryDirectory()` with the script itself **0500**, then run via `osascript … with administrator privileges`. It runs as root — never relax those modes and never put it in a world-writable path like `/tmp`.
 
 ---
 
 ## Status
+
+**Released publicly 2026-08-19 as 1.0.** Verified the way a stranger would see it: the repository, the release and the asset all fetch anonymously, the downloaded DMG is SHA-256 identical to the built one (`d212be6c…`), and the app inside it passes `spctl --assess` as `source=Notarized Developer ID`. `docs/screenshot.png` in the README is the real picker, captured against two throwaway 32 GB exFAT volumes carrying a synthetic rekordbox library — note that launching the app against fixtures writes sighting records into the real `drives.json`, so back that file up and restore it if you do this again.
 
 Working and verified: drive detection (against real USB hardware), file-level mirror sync, incremental re-runs, mirror deletion, verification, cancellation and resume, preflight blockers, source health screening, notifications, icon.
 
