@@ -16,46 +16,56 @@ struct DrivePickerView: View {
     @State private var driveToErase: Drive?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metrics.sectionSpacing) {
-            hero
-            modePicker
+        // The page scrolls; the footer does not.
+        //
+        // This screen is the only one whose height is set by something outside
+        // the app's control — how many volumes are plugged in — and the window
+        // cannot be resized below `Metrics.windowMinHeight` to suit it. Laid out
+        // as a plain `VStack`, the drive rows are what gives: each is a stack of
+        // single-line labels that can't lose any height, so a stack told to fit
+        // them into less space hands each row a smaller slot and the rows draw
+        // over each other. That was visible at the minimum window size with two
+        // volumes mounted — names and format badges sitting outside their card,
+        // on top of the previous row's history line.
+        //
+        // One scroll region containing everything is what fixes it, rather than
+        // a scroll view around the lists alone: as siblings, the lists and the
+        // fixed chrome negotiate for height and the lists still lose. As the
+        // only flexible child, the scroll region absorbs the whole shortfall and
+        // its contents are laid out at their natural size.
+        //
+        // The footer stays outside it deliberately. Continue is the point of the
+        // screen and must never be scrolled out of reach.
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: Metrics.sectionSpacing) {
+                    hero
+                    modePicker
 
-            if drives.isEmpty {
-                emptyState
-            } else {
-                // Compare writes to neither drive, so the sections are named for
-                // what they are — two drives being looked at — rather than for a
-                // direction the mode doesn't have.
-                driveSection(
-                    title: job.mode.isInspection ? "Compare" : "Copy from",
-                    systemImage: job.mode.isInspection ? "externaldrive.fill" : "arrow.up.circle.fill",
-                    selection: $job.source,
-                    excluded: job.target,
-                    role: .from
-                )
-
-                driveSection(
-                    title: job.mode.isInspection ? "With" : "Copy to",
-                    systemImage: job.mode.isInspection ? "externaldrive.fill" : "arrow.down.circle.fill",
-                    selection: $job.target,
-                    excluded: job.source,
-                    // A write-protected drive is a perfectly good thing to
-                    // compare against, so the read-only exclusion applies only
-                    // when something is actually going to be written.
-                    isDestination: !job.mode.isInspection,
-                    // Only on the destination side, and only when a copy is
-                    // actually going to happen. Compare writes to nothing, so an
-                    // erase button on that screen would contradict the mode's
-                    // own promise.
-                    offersErase: !job.mode.isInspection,
-                    role: .to
-                )
+                    if drives.isEmpty {
+                        emptyState
+                    } else {
+                        driveLists
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, Metrics.pagePadding)
+                .padding(.top, Metrics.pagePadding)
+                .padding(.bottom, Metrics.sectionSpacing)
             }
+            .scrollIndicators(.automatic)
+            .frame(maxHeight: .infinity)
 
-            Spacer(minLength: 0)
             footer
+                .padding(.horizontal, Metrics.pagePadding)
+                .padding(.top, 6)
+                .padding(.bottom, Metrics.pagePadding)
         }
-        .pageLayout()
+        .frame(
+            minWidth: Metrics.windowMinWidth,
+            minHeight: Metrics.windowMinHeight,
+            alignment: .topLeading
+        )
         .onChange(of: job.mode) { _, newMode in
             // Exact Clone is a raw device copy and can't touch a file. Clearing
             // the selection is honest about that rather than leaving a row
@@ -141,6 +151,39 @@ struct DrivePickerView: View {
     }
 
     // MARK: - Drives
+
+    /// The two drive lists. Scrolling is handled by the page around them.
+    private var driveLists: some View {
+        VStack(alignment: .leading, spacing: Metrics.sectionSpacing) {
+            // Compare writes to neither drive, so the sections are named for
+            // what they are — two drives being looked at — rather than for a
+            // direction the mode doesn't have.
+            driveSection(
+                title: job.mode.isInspection ? "Compare" : "Copy from",
+                systemImage: job.mode.isInspection ? "externaldrive.fill" : "arrow.up.circle.fill",
+                selection: $job.source,
+                excluded: job.target,
+                role: .from
+            )
+
+            driveSection(
+                title: job.mode.isInspection ? "With" : "Copy to",
+                systemImage: job.mode.isInspection ? "externaldrive.fill" : "arrow.down.circle.fill",
+                selection: $job.target,
+                excluded: job.source,
+                // A write-protected drive is a perfectly good thing to
+                // compare against, so the read-only exclusion applies only
+                // when something is actually going to be written.
+                isDestination: !job.mode.isInspection,
+                // Only on the destination side, and only when a copy is
+                // actually going to happen. Compare writes to nothing, so an
+                // erase button on that screen would contradict the mode's
+                // own promise.
+                offersErase: !job.mode.isInspection,
+                role: .to
+            )
+        }
+    }
 
     /// Which end of the copy a section represents. The two ends offer different
     /// image actions: you can only ever *open* an image to read from, but the
