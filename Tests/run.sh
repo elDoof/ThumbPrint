@@ -40,9 +40,14 @@ try:
 except Exception:
     sys.exit(0)
 for image in data.get("images", []):
+    path = image.get("image-path", "")
+    # Matched on the image path as well as the mount point: the erase check
+    # repartitions a throwaway image, and the volume that comes back is mounted
+    # at /Volumes/<name>, nowhere near $WORK.
+    owned = bool(work) and path.startswith(work)
     for entity in image.get("system-entities", []):
         point = entity.get("mount-point", "")
-        if work and point.startswith(work):
+        if owned or (work and point.startswith(work)):
             subprocess.run(["hdiutil", "detach", entity.get("dev-entry", point),
                             "-force", "-quiet"], check=False)
 ' 2>/dev/null
@@ -106,12 +111,19 @@ echo "==> Compiling harness"
 # boundary between the mirror and a mounted image, and that boundary is only
 # worth anything if the suite actually drives a copy across it.
 #
-# `DriveRegistry` and `DriveScanner` stay out — they're the @MainActor
-# @Observable wrappers, which is why every rule worth testing lives in a value
-# type instead.
+# `DriveFormatter` and `UpdateInstaller` are in for the same reason: the erase
+# checks drive a real `diskutil eraseDisk` against a throwaway image, and the
+# update checks pin the pinned-signature requirement and the feed parsing. The
+# network half of `UpdateInstaller` is compiled but never called.
+#
+# `DriveRegistry`, `DriveScanner` and `UpdateController` stay out — they're the
+# @MainActor @Observable wrappers, which is why every rule worth testing lives in
+# a value type instead.
 swiftc -o "$WORK/harness" \
     "$TP"/Model/{Drive,CloneMode,CloneError,CloneProgress,FileIndex,ComparisonReport,DriveRecord,Endpoint,ImagePreflight}.swift \
+    "$TP"/Model/{DiskFormat,FormatPreflight,AppVersion,UpdateRelease}.swift \
     "$TP"/Services/{LibraryCheck,DriveRegistryStore,DiskImageStore,FileSyncEngine,Verifier}.swift \
+    "$TP"/Services/{DriveFormatter,UpdateInstaller}.swift \
     "$TP"/Views/Formatting.swift \
     "$ROOT/Tests/main.swift" || exit 2
 

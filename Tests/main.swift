@@ -574,6 +574,340 @@ do {
           legacyStore.record(for: djDrive)?.lastSync?.imagePath == nil)
     check("and the store stays writable", legacyStore.canSave)
 
+    // =========================================================================
+    print("\n=== M. Erase rules (FormatPreflight) ===")
+    // =========================================================================
+
+    // The one operation in this app that destroys data it wasn't asked to copy,
+    // so its refusals get the same treatment as ImagePreflight's: pure rules,
+    // driven directly, with no drive and no subprocess involved.
+
+    func eraseDrive(
+        path: String = "/Volumes/BACKUPDJ",
+        name: String = "BACKUPDJ",
+        bsd: String? = "disk6",
+        total: Int64 = 128_000_000_000,
+        available: Int64 = 100_000_000_000,
+        format: String = "ExFAT",
+        readOnly: Bool = false
+    ) -> Drive {
+        Drive(
+            volumeURL: URL(fileURLWithPath: path),
+            name: name,
+            wholeDiskBSDName: bsd,
+            totalCapacity: total,
+            availableCapacity: available,
+            volumeUUID: "11111111-2222-3333-4444-555555555555",
+            formatDescription: format,
+            isReadOnly: readOnly
+        )
+    }
+
+    func eraseFacts(
+        drive: Drive = eraseDrive(),
+        format: DiskFormat = .exFAT,
+        name: String = "BACKUPDJ",
+        diskSize: Int64 = 128_000_000_000,
+        siblings: [FormatPreflight.SiblingVolume] = [],
+        sourcePath: String? = "/Volumes/HOTFIRE",
+        sourceDisk: String? = "disk4",
+        images: [URL] = []
+    ) -> FormatPreflight.Facts {
+        FormatPreflight.Facts(
+            drive: drive,
+            format: format,
+            requestedName: name,
+            wholeDiskSize: diskSize,
+            siblings: siblings,
+            sourceVolumePath: sourcePath,
+            sourceWholeDiskBSDName: sourceDisk,
+            selectedImageURLs: images
+        )
+    }
+
+    let sane = FormatPreflight.evaluate(eraseFacts())
+    check("a sane erase has no blockers", sane.blockers.isEmpty,
+          sane.blockers.joined(separator: " | "))
+    check("and produces an approval", FormatPreflight.approve(eraseFacts()) != nil)
+
+    // The one rule, restated for the one operation that isn't a copy.
+    let eraseTheSource = eraseFacts(
+        drive: eraseDrive(path: "/Volumes/HOTFIRE", name: "HOTFIRE", bsd: "disk4")
+    )
+    check("erasing the source volume is blocked", !FormatPreflight.evaluate(eraseTheSource).blockers.isEmpty)
+    check("and no approval is minted for it", FormatPreflight.approve(eraseTheSource) == nil)
+
+    // The subtle half: a different volume on the same physical stick. The erase
+    // rewrites the whole disk, so the source goes with it.
+    let sameDisk = eraseFacts(
+        drive: eraseDrive(path: "/Volumes/SPARE", name: "SPARE", bsd: "disk4")
+    )
+    check("erasing another partition of the source's disk is blocked",
+          FormatPreflight.evaluate(sameDisk).blockers.contains { $0.contains("same physical disk") })
+    check("no approval for that either", FormatPreflight.approve(sameDisk) == nil)
+
+    check("a drive with no disk device is blocked",
+          !FormatPreflight.evaluate(eraseFacts(drive: eraseDrive(bsd: nil))).blockers.isEmpty)
+    check("and cannot be approved", FormatPreflight.approve(eraseFacts(drive: eraseDrive(bsd: nil))) == nil)
+
+    check("a read-only drive is blocked",
+          !FormatPreflight.evaluate(eraseFacts(drive: eraseDrive(readOnly: true))).blockers.isEmpty)
+
+    // FAT32's addressable ceiling. Refused before the erase starts, because
+    // newfs_msdos refuses it *after* diskutil has rewritten the partition map.
+    let overLimit = DiskFormat.fat32MaximumCapacity + 1
+    check("FAT32 above 2 TB is blocked",
+          !FormatPreflight.evaluate(eraseFacts(format: .fat32, diskSize: overLimit)).blockers.isEmpty)
+    check("FAT32 exactly at the limit is allowed",
+          FormatPreflight.evaluate(
+              eraseFacts(format: .fat32, diskSize: DiskFormat.fat32MaximumCapacity)
+          ).blockers.isEmpty)
+    check("exFAT at the same size is allowed",
+          FormatPreflight.evaluate(eraseFacts(format: .exFAT, diskSize: overLimit)).blockers.isEmpty)
+
+    // A disk image selected for the copy, sitting on the drive about to go.
+    check("an image on the drive being erased is blocked",
+          !FormatPreflight.evaluate(eraseFacts(
+              images: [URL(fileURLWithPath: "/Volumes/BACKUPDJ/backup.sparseimage")]
+          )).blockers.isEmpty)
+    check("an image on a similarly-named volume is not",
+          FormatPreflight.evaluate(eraseFacts(
+              drive: eraseDrive(path: "/Volumes/BACKUP", name: "BACKUP"),
+              images: [URL(fileURLWithPath: "/Volumes/BACKUPDJ/backup.sparseimage")]
+          )).blockers.isEmpty)
+
+    let warnings = FormatPreflight.evaluate(eraseFacts()).warnings
+    check("the irreversible warning is always present",
+          warnings.contains { $0.contains("permanently erased") && $0.contains("can't be undone") },
+          warnings.joined(separator: " | "))
+
+    let withSiblings = FormatPreflight.evaluate(eraseFacts(siblings: [
+        .init(deviceIdentifier: "disk6s1", volumeName: "BACKUPDJ", content: "Windows_NTFS", size: 1),
+        .init(deviceIdentifier: "disk6s2", volumeName: "SCRATCH", content: "Apple_HFS", size: 2),
+    ]))
+    check("other partitions on the disk are named",
+          withSiblings.warnings.contains { $0.contains("SCRATCH") })
+    check("the drive itself is not listed as collateral",
+          !withSiblings.warnings.contains { $0.contains("1 other partition") && $0.contains("BACKUPDJ,") })
+
+    check("FAT32 mentions its 4 GB file ceiling",
+          FormatPreflight.evaluate(eraseFacts(format: .fat32)).warnings
+              .contains { $0.contains("4 GB") })
+    check("exFAT does not",
+          !FormatPreflight.evaluate(eraseFacts(format: .exFAT)).warnings
+              .contains { $0.contains("4 GB") })
+
+    // Volume-label limits are the filesystem's, and the sanitizer is the image
+    // feature's — deliberately shared rather than reimplemented.
+    let longName = eraseFacts(format: .fat32, name: "MY VERY LONG DRIVE NAME")
+    check("a name too long for FAT32 is truncated to 11",
+          FormatPreflight.sanitizedName("MY VERY LONG DRIVE NAME", format: .fat32).count == 11,
+          FormatPreflight.sanitizedName("MY VERY LONG DRIVE NAME", format: .fat32))
+    check("and the user is told what the drive will actually be called",
+          FormatPreflight.evaluate(longName).warnings.contains { $0.contains("will be named") })
+    check("exFAT allows 15", FormatPreflight.sanitizedName("MY VERY LONG DRIVE NAME", format: .exFAT).count == 15)
+
+    if let approval = FormatPreflight.approve(longName) {
+        check("the approval carries the sanitized name, not what was typed",
+              approval.volumeName == FormatPreflight.sanitizedName("MY VERY LONG DRIVE NAME", format: .fat32),
+              approval.volumeName)
+        check("and the whole-disk device node", approval.deviceNode == "/dev/disk6", approval.deviceNode)
+    } else {
+        check("an approval is produced for a long name", false, "approve returned nil")
+    }
+
+    check("the partition scheme is MBR", DiskFormat.partitionScheme == "MBR")
+    check("diskutil spellings match hdiutil's",
+          DiskFormat.exFAT.diskutilName == DiskImageStore.filesystemArgument(matching: "ExFAT")
+              && DiskFormat.fat32.diskutilName == DiskImageStore.filesystemArgument(matching: "MS-DOS FAT32"))
+
+    // =========================================================================
+    print("\n=== N. Erasing a real disk ===")
+    // =========================================================================
+
+    // A whole-disk erase against a throwaway sparse image: the same
+    // `diskutil eraseDisk` a USB stick gets, on a device node nothing else owns.
+    // This is what proves the command is spelled correctly and that the volume
+    // comes back — neither of which the pure rules above can say anything about.
+
+    let eraseImage = try DiskImageStore.create(
+        at: imagesDir.appendingPathComponent("erase-me.sparseimage"),
+        sizeBytes: 300 * 1024 * 1024,
+        filesystem: "ExFAT",
+        volumeName: "TPBEFORE"
+    )
+    let erasePoint = try DiskImageStore.makeMountPoint()
+    let eraseAttachment = try DiskImageStore.attach(eraseImage, readOnly: false, mountPoint: erasePoint)
+    let eraseBSD = eraseAttachment.devEntry.replacingOccurrences(of: "/dev/", with: "")
+
+    try Data("mp3".utf8).write(to: eraseAttachment.mountPoint.appendingPathComponent("Track.mp3"))
+    check("the throwaway volume has a file on it before the erase",
+          FileManager.default.fileExists(atPath: eraseAttachment.mountPoint.appendingPathComponent("Track.mp3").path))
+
+    check("diskutil reports a size for the attached disk",
+          DriveFormatter.wholeDiskSize(bsdName: eraseBSD) > 0)
+    check("and at least one partition on it",
+          !DriveFormatter.partitions(onWholeDisk: eraseBSD).isEmpty)
+
+    // `DiskImageStore.drive(for:)` deliberately reports no whole-disk name, so
+    // the drive is rebuilt here with the one the attachment gave us.
+    let eraseSubject = Drive(
+        volumeURL: eraseAttachment.mountPoint,
+        name: "TPBEFORE",
+        wholeDiskBSDName: eraseBSD,
+        totalCapacity: 300 * 1024 * 1024,
+        availableCapacity: 290 * 1024 * 1024,
+        volumeUUID: nil,
+        formatDescription: "ExFAT",
+        isReadOnly: false
+    )
+
+    guard let realApproval = FormatPreflight.approve(eraseFacts(
+        drive: eraseSubject,
+        format: .fat32,
+        name: "TPAFTER",
+        diskSize: DriveFormatter.wholeDiskSize(bsdName: eraseBSD),
+        siblings: DriveFormatter.partitions(onWholeDisk: eraseBSD),
+        sourcePath: srcPath,
+        sourceDisk: nil
+    )) else {
+        print("harness error: the throwaway disk was refused by FormatPreflight")
+        exit(2)
+    }
+
+    var steps: [String] = []
+    let erased = try DriveFormatter.erase(realApproval) { steps.append($0) }
+
+    check("the erase reported its progress", !steps.isEmpty, "no lines captured")
+    check("the volume came back named TPAFTER", erased.name == "TPAFTER", erased.name)
+    check("in the format that was asked for",
+          erased.formatDescription.lowercased().contains("fat")
+              && !erased.formatDescription.lowercased().contains("exfat"),
+          erased.formatDescription)
+    check("the file that was on it is gone",
+          !FileManager.default.fileExists(atPath: erased.volumeURL.appendingPathComponent("Track.mp3").path))
+    check("the erased volume is writable", FileManager.default.isWritableFile(atPath: erased.volumeURL.path))
+    check("and it keeps the whole-disk name it was erased under",
+          erased.wholeDiskBSDName == eraseBSD)
+
+    _ = DiskImageStore.detach(DiskImageStore.Attachment(
+        devEntry: eraseAttachment.devEntry,
+        mountPoint: erased.volumeURL,
+        imageURL: eraseImage,
+        isReadOnly: false
+    ))
+    check("the erased image detaches cleanly", DiskImageStore.attachment(for: eraseImage) == nil)
+
+    // =========================================================================
+    print("\n=== O. Version comparison ===")
+    // =========================================================================
+
+    func version(_ string: String) -> AppVersion? { AppVersion(string) }
+
+    check("a plain version parses", version("1.0") != nil)
+    check("a v-prefixed tag parses", version("v1.1") != nil)
+    check("the raw text is preserved for display", version("v1.1")?.raw == "v1.1")
+    check("nonsense doesn't parse", version("beta") == nil)
+    check("an empty string doesn't parse", version("") == nil)
+
+    // The reason this type exists: string ordering puts "1.10" before "1.9", and
+    // an update check that got this wrong would decide it was already current
+    // and never offer the newer build again.
+    check("1.10 is newer than 1.9", version("1.10")! > version("1.9")!)
+    check("2.0 is newer than 1.99.99", version("2.0")! > version("1.99.99")!)
+    check("1.0 and 1.0.0 are the same version", version("1.0")! == version("1.0.0")!)
+    check("v1.0 and 1.0 are the same version", version("v1.0")! == version("1.0")!)
+    check("1.2-beta reads as 1.2", version("1.2-beta")! == version("1.2")!)
+    check("1.0.1 is newer than 1.0", version("1.0.1")! > version("1.0")!)
+    check("a version is not newer than itself", !(version("1.0")! > version("1.0")!))
+
+    // =========================================================================
+    print("\n=== P. Reading a GitHub release ===")
+    // =========================================================================
+
+    func feed(_ json: String) -> Data { Data(json.utf8) }
+
+    let goodFeed = """
+    {"tag_name":"v1.1","name":"ThumbPrint 1.1","draft":false,"prerelease":false,
+     "body":"- Erase a backup drive\\n- Check for updates",
+     "published_at":"2026-09-01T10:00:00Z",
+     "assets":[{"name":"ThumbPrint-1.1.dmg","size":2400000,
+                "browser_download_url":"https://example.invalid/ThumbPrint-1.1.dmg"}]}
+    """
+
+    let release = try UpdateRelease.parse(feed(goodFeed))
+    check("the tag becomes a version", release.version == AppVersion("1.1")!)
+    check("the tag is kept verbatim", release.tag == "v1.1")
+    check("the title comes through", release.title == "ThumbPrint 1.1")
+    check("the notes come through", release.notes.contains("Erase a backup drive"))
+    check("the download URL is the dmg's",
+          release.downloadURL.absoluteString == "https://example.invalid/ThumbPrint-1.1.dmg")
+    check("the asset size is read", release.assetSize == 2_400_000)
+    check("the publish date is parsed", release.publishedAt != nil)
+
+    check("1.1 is offered to a 1.0 install", release.isNewer(than: AppVersion("1.0")!))
+    check("1.1 is not offered to a 1.1 install", !release.isNewer(than: AppVersion("1.1")!))
+    check("1.1 is not offered to a 1.2 install", !release.isNewer(than: AppVersion("1.2")!))
+    // A build with no marketing version can't be compared, and offering an
+    // update to it would mean replacing something on the strength of nothing.
+    check("nothing is offered when the running version is unknown", !release.isNewer(than: nil))
+
+    func parseFails(_ json: String, _ expected: UpdateRelease.ParseFailure) -> Bool {
+        do { _ = try UpdateRelease.parse(feed(json)); return false }
+        catch let failure as UpdateRelease.ParseFailure { return failure == expected }
+        catch { return false }
+    }
+
+    check("a draft is refused", parseFails("""
+    {"tag_name":"v2.0","draft":true,"prerelease":false,"assets":[]}
+    """, .notAPublishedRelease))
+
+    check("a pre-release is refused", parseFails("""
+    {"tag_name":"v2.0","draft":false,"prerelease":true,"assets":[]}
+    """, .notAPublishedRelease))
+
+    check("a release with no dmg is refused", parseFails("""
+    {"tag_name":"v2.0","draft":false,"prerelease":false,
+     "assets":[{"name":"source.zip","size":10,"browser_download_url":"https://example.invalid/s.zip"}]}
+    """, .noDiskImageAsset("v2.0")))
+
+    check("a tag that isn't a version is refused", parseFails("""
+    {"tag_name":"nightly","draft":false,"prerelease":false,
+     "assets":[{"name":"ThumbPrint.dmg","size":10,"browser_download_url":"https://example.invalid/a.dmg"}]}
+    """, .noVersionInTag("nightly")))
+
+    check("garbage is refused", parseFails("not json at all", .malformedFeed))
+
+    // Two disk images attached: the one naming the version wins, so a stray
+    // build can't be installed by being listed first.
+    let twoAssets = try UpdateRelease.parse(feed("""
+    {"tag_name":"v1.5","draft":false,"prerelease":false,
+     "assets":[{"name":"ThumbPrint-debug.dmg","size":1,
+                "browser_download_url":"https://example.invalid/debug.dmg"},
+               {"name":"ThumbPrint-1.5.dmg","size":2,
+                "browser_download_url":"https://example.invalid/ThumbPrint-1.5.dmg"}]}
+    """))
+    check("the versioned dmg is chosen over a stray one",
+          twoAssets.assetName == "ThumbPrint-1.5.dmg", twoAssets.assetName)
+
+    // The pinned code requirement is the security boundary of the whole feature.
+    check("the update requirement pins Apple's anchor",
+          UpdateInstaller.codeRequirement.contains("anchor apple generic"))
+    check("it pins this bundle identifier",
+          UpdateInstaller.codeRequirement.contains("com.saschanowlin.ThumbPrint"))
+    check("it pins the signing team",
+          UpdateInstaller.codeRequirement.contains("DPLC4BD7ST"))
+
+    // A build tree is never replaced in place: swapping a developer's debug
+    // build for the public release would be a genuinely confusing thing to do.
+    check("a build-folder app is not replaced in place",
+          UpdateInstaller.destination(
+              for: URL(fileURLWithPath: "/Users/dj/Library/Developer/Xcode/DerivedData/x/Build/Products/Debug/ThumbPrint.app")
+          ) != .replace(URL(fileURLWithPath: "/Users/dj/Library/Developer/Xcode/DerivedData/x/Build/Products/Debug/ThumbPrint.app")))
+    check("an unwritable location is not replaced in place",
+          UpdateInstaller.destination(for: URL(fileURLWithPath: "/System/Applications/ThumbPrint.app"))
+              == .revealOnly("ThumbPrint is installed somewhere this app can't write to (/System/Applications)."))
+
     print(failures == 0 ? "\nALL CHECKS PASSED" : "\n\(failures) CHECK(S) FAILED")
     exit(failures == 0 ? 0 : 1)
 } catch {

@@ -10,6 +10,11 @@ struct DrivePickerView: View {
     /// alone, and saying so at the moment of choosing beats failing in analysis.
     @State private var selectionError: String?
 
+    /// The drive the erase sheet is open for. Held as a value rather than read
+    /// back from `job.target`, because erasing unmounts the volume — the
+    /// selection is dropped underneath the sheet while it works.
+    @State private var driveToErase: Drive?
+
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.sectionSpacing) {
             hero
@@ -38,6 +43,11 @@ struct DrivePickerView: View {
                     // compare against, so the read-only exclusion applies only
                     // when something is actually going to be written.
                     isDestination: !job.mode.isInspection,
+                    // Only on the destination side, and only when a copy is
+                    // actually going to happen. Compare writes to nothing, so an
+                    // erase button on that screen would contradict the mode's
+                    // own promise.
+                    offersErase: !job.mode.isInspection,
                     role: .to
                 )
             }
@@ -64,6 +74,24 @@ struct DrivePickerView: View {
             Button("OK", role: .cancel) { selectionError = nil }
         } message: {
             Text(selectionError ?? "")
+        }
+        .sheet(item: $driveToErase) { drive in
+            FormatDriveView(
+                drive: drive,
+                source: job.source,
+                // Both sides: an image on the source is the file being restored
+                // from, and one on the target is the file about to be written.
+                // Either sitting on this drive is destroyed by the erase.
+                selectedImageURLs: [job.source?.imageURL, job.target?.imageURL].compactMap { $0 },
+                onErased: { erased in
+                    // Re-select it: the volume was unmounted and remounted, and
+                    // leaving the destination blank after the user prepared a
+                    // drive for exactly this purpose would be an odd place to
+                    // stop.
+                    job.target = .drive(erased)
+                },
+                onCancel: { driveToErase = nil }
+            )
         }
     }
 
@@ -125,9 +153,11 @@ struct DrivePickerView: View {
         selection: Binding<Endpoint?>,
         excluded: Endpoint?,
         isDestination: Bool = false,
+        offersErase: Bool = false,
         role: SectionRole
     ) -> some View {
         let showsImageRows = job.mode.allowsImageEndpoints
+        let eraseTarget = offersErase ? selection.wrappedValue?.driveValue : nil
 
         return VStack(alignment: .leading, spacing: 7) {
             SectionLabel(title, systemImage: systemImage)
@@ -148,7 +178,7 @@ struct DrivePickerView: View {
                         selection.wrappedValue = .drive(drive)
                     }
 
-                    if drive.id != drives.last?.id || showsImageRows {
+                    if drive.id != drives.last?.id || showsImageRows || eraseTarget != nil {
                         // Inset to start under the text, not the icon, so the
                         // rule reads as separating entries rather than columns.
                         Divider().padding(.leading, 52)
@@ -157,6 +187,11 @@ struct DrivePickerView: View {
 
                 if showsImageRows {
                     imageRows(selection: selection, role: role)
+                }
+
+                if let eraseTarget {
+                    if showsImageRows { Divider().padding(.leading, 52) }
+                    eraseRow(for: eraseTarget)
                 }
             }
             .cardEdgeToEdge()
@@ -203,6 +238,23 @@ struct DrivePickerView: View {
             ) {
                 chooseExistingImage(for: selection)
             }
+        }
+    }
+
+    /// The way in to the one destructive thing this app does that isn't a copy.
+    ///
+    /// Only ever on the destination side, and only for the drive already chosen
+    /// as the destination — so the row can't be the thing that makes someone
+    /// erase a drive they weren't already pointing at. The refusals that matter
+    /// are in `FormatPreflight`; this is just where the door is.
+    private func eraseRow(for drive: Drive) -> some View {
+        ImageFileRow(
+            title: "Erase “\(drive.name)”…",
+            subtitle: "Reformat as exFAT or FAT32 before backing up to it",
+            systemImage: "eraser",
+            isPlaceholder: true
+        ) {
+            driveToErase = drive
         }
     }
 

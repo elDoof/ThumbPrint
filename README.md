@@ -37,6 +37,10 @@ Pick a source drive and a destination, and choose how to copy:
 
 Either side of a copy can also be a **disk image** instead of a drive, so a backup can be made with only one stick plugged in and restored onto a replacement later.
 
+A backup drive can be **erased** from the destination list before you copy to it — a whole-disk reformat to exFAT or FAT32 with an MBR partition map, which is the layout players expect and the usual reason a stick that mounts fine on a Mac shows nothing on a CDJ. Only the destination is ever offered; the drive you are copying *from* is refused, and so is any drive sharing a physical disk with it.
+
+ThumbPrint also **checks for its own updates** once a day and installs them for you. Nothing is replaced until the download has been checked against the same Developer ID this copy was signed with, and the check is silent unless there is genuinely a newer version — there is no prompt while a backup is running.
+
 Before any copy starts, ThumbPrint checks the things that actually go wrong: free space on the real destination, a damaged source filesystem, a read-only target, and a rekordbox or Serato library whose database is older than the tracks around it — the reason a drive can look fine in Finder and still be missing songs in the player. Anything that would break the copy blocks it; anything that is merely worth knowing is shown as a warning. Afterwards every copied file is re-read and verified, and each drive is remembered, so the picker can tell you what a drive was last backed up to and when.
 
 ## Why it exists
@@ -55,13 +59,15 @@ ThumbPrint handles all three, because it was built for exactly one job.
 
 It has been proven three ways: a static audit of every write path, a full sync from a source attached read-only so the kernel itself rejects any write, and a byte-level before/after snapshot of the source tree. When a source is used from a disk image, that image is attached read-only, which makes the guarantee automatic rather than a rule someone has to remember.
 
-A consequence worth stating up front: there is no repair or format feature. When a source drive is damaged, ThumbPrint detects it, explains it, and hands off to Disk Utility. That is a design decision, not a gap.
+A consequence worth stating up front: there is no repair feature. When a source drive is damaged, ThumbPrint detects it, explains it, and hands off to Disk Utility. That is a design decision, not a gap.
+
+Erasing a *backup* drive is not an exception to the rule. It only ever applies to the destination, and the refusal is built into the types rather than left to a check: the code that runs `diskutil` cannot be called without a permission token that the safety rules withhold whenever the drive is — or shares a disk with — the source.
 
 ## Status
 
 Verified against real hardware: drive detection, Fast Sync and incremental re-runs, mirror deletion, verification, cancellation and resume, preflight blockers, and source health screening. ThumbPrint backups have loaded on real players twice — an 18.2 GB FAT32 → exFAT backup in a CDJ, and a full ~81 GB FAT32 → FAT32 backup on an XDJ-RX3 with rekordbox cue points intact.
 
-Disk image save and restore is covered by 124 automated checks against real filesystems, but has not yet been run against a large library on real DJ hardware. **Exact Clone has not been tested against real hardware at all** — treat it as experimental and keep a second copy of anything you care about.
+Disk image save and restore is covered by automated checks against real filesystems, but has not yet been run against a large library on real DJ hardware. Erasing is covered the same way — including a real `diskutil` erase of a throwaway disk image — but has not been run against a USB stick. **Exact Clone has not been tested against real hardware at all** — treat it as experimental and keep a second copy of anything you care about.
 
 ## Building from source
 
@@ -83,7 +89,7 @@ Run the test suite before and after changing anything under `Model/` or `Service
 ./Tests/run.sh
 ```
 
-It builds its own throwaway exFAT volumes and disk images, runs 124 checks against real filesystems, and cleans up after itself. It writes nothing inside the repository and touches no real drive.
+It builds its own throwaway exFAT volumes and disk images, runs 194 checks against real filesystems, and cleans up after itself. It writes nothing inside the repository and touches no real drive.
 
 App Sandbox is off and must stay off — raw device I/O and access to arbitrary volumes are incompatible with it. There is no Mac App Store build.
 

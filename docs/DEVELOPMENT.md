@@ -6,18 +6,20 @@ Two modes, chosen per run:
 - **Fast Sync** — file-level mirror. Copies only what changed; deletes from the backup anything no longer on the source. The everyday path.
 - **Exact Clone** — bit-for-bit `dd` of the whole disk, behind the standard macOS admin prompt.
 
+A backup drive can also be **erased** from the picker before it's copied to, and the app **checks GitHub for its own updates** once a day.
+
 ---
 
 ## Where this stands
 
 Read this first if you're picking the project up cold.
 
-- **Git:** public at `elDoof/ThumbPrint` on GitHub, branch `main`, MIT licensed. **1.0 shipped 2026-08-19** — release `v1.0` carries a notarized `ThumbPrint-1.0.dmg`. History was squashed to a single authored commit for the public release and the old repository was deleted and recreated rather than force-pushed, so no earlier object survives on GitHub. The pre-release history exists only on the local branch `archive/pre-public-history`. No CI; releases are cut by hand with `Scripts/release.sh`.
+- **Git:** public at `elDoof/ThumbPrint` on GitHub, branch `main`, MIT licensed. **1.0 shipped 2026-08-19** — release `v1.0` carries a notarized `ThumbPrint-1.0.dmg`. History was squashed to a single authored commit for the public release and the old repository was deleted and recreated rather than force-pushed, so no earlier object survives on GitHub. The pre-release history exists only on the local branch `archive/pre-public-history`. No CI; releases are cut by hand with `Scripts/release.sh`. **The tree is at 1.1** — erasing a backup drive and the in-app update check, both built and tested on 2026-08-19 but not yet released. Cutting `v1.1` is also what makes the update check do anything observable: 1.0 has nothing newer to find.
 - **Distribution:** signed with `Developer ID Application: Sascha Nowlin (DPLC4BD7ST)` and notarized under the `djsnowlin@gmail.com` Apple account. The Xcode project stays ad-hoc signed so a fork builds with no certificate; the Developer ID, hardened runtime and secure timestamp are applied only by `Scripts/release.sh`.
-- **Tests:** `./Tests/run.sh` is the suite (124 checks). It builds its own throwaway exFAT volumes and disk images, runs, and cleans up after itself. Run it before and after touching `Model/` or `Services/`.
-- **Built and covered by tests:** Fast Sync, Exact Clone (code only — see below), export-staleness screening, Compare mode, the drive registry, disk image save/restore.
+- **Tests:** `./Tests/run.sh` is the suite (194 checks). It builds its own throwaway exFAT volumes and disk images, runs, and cleans up after itself. Run it before and after touching `Model/` or `Services/`.
+- **Built and covered by tests:** Fast Sync, Exact Clone (code only — see below), export-staleness screening, Compare mode, the drive registry, disk image save/restore, erasing a backup drive, and the update check.
 - **Next on the roadmap:** the pre-gig readiness check, then library-aware verification. Both described under [Roadmap](#roadmap), including what the second one must verify before any `.pdb` parsing is written.
-- **Never verified against real hardware:** Exact Clone — still the main open risk. Disk image save/restore is close behind: heavily covered by the harness against real `hdiutil` images, but never once against a DJ stick or a large library. Also unproven in the running app: the drive registry's picker line and its Application Support file, Compare against two *large* real libraries, and **the picker's disk-image rows, its two file panels, and the image preflight wording** — the engine path below them has 60 checks, the UI above them has none.
+- **Never verified against real hardware:** Exact Clone — still the main open risk. Erasing is next after it: the harness runs a real `diskutil eraseDisk` against a throwaway disk image, which is the same command against a device node, but no USB stick has been through it and no erased stick has then been loaded in a CDJ. The update feature's every piece is proven — the live GitHub fetch, the pinned signature check accepting the shipped 1.0 and rejecting an unrelated Apple app, the version pin, and a real bundle swap against a scratch copy of the app using the real notarized DMG — but **nobody has clicked Install and Relaunch in the running app**, because 1.0 is still the newest release and there is nothing to update to. Disk image save/restore is close behind: heavily covered by the harness against real `hdiutil` images, but never once against a DJ stick or a large library. Also unproven in the running app: the drive registry's picker line and its Application Support file, Compare against two *large* real libraries, and **the picker's disk-image rows, its two file panels, and the image preflight wording** — the engine path below them has 60 checks, the UI above them has none.
 - **Two soft assumptions are recorded rather than hidden**, both in [Roadmap](#roadmap): `LibraryReport.staleTolerance` (whether an export writes its database before or after the audio was never measured), and the `.pdb`/Serato format claims, which are community reverse-engineering and must be checked against the live `HOTFIRE` tree before anything is built on them.
 
 ---
@@ -47,6 +49,14 @@ Output is `dist/ThumbPrint-<version>.dmg`. Bump `MARKETING_VERSION` in `project.
 the script reads the version from the built bundle, so the filename and the DMG volume name follow automatically.
 Then `gh release create v<version> dist/ThumbPrint-<version>.dmg --title "ThumbPrint <version>" --notes-file <file>`.
 
+**The release is now also the update feed**, so three things about it are load-bearing rather than cosmetic:
+
+- **The tag must parse as a version.** `AppVersion` accepts `v1.1`, `1.1`, `1.1.2`; it does not accept `nightly`, and `UpdateRelease.parse` refuses the whole feed rather than guessing.
+- **A `.dmg` must be attached.** No asset, no update — the app says so instead of silently doing nothing. If more than one `.dmg` is attached the one naming the version wins.
+- **The notes are shown verbatim in the app.** `--notes-file` content lands in the update sheet as Markdown, so write it for the person deciding whether to install, not for a changelog.
+
+Drafts and pre-releases are ignored by `releases/latest` and refused again by the parser, so a draft can be staged safely.
+
 Notarization needs a keychain profile named `ThumbPrint`, stored once with an app-specific password from
 appleid.apple.com under the `djsnowlin@gmail.com` Apple account:
 
@@ -71,6 +81,7 @@ that has no ticket yet — that is the expected state of that mode, not a failur
 Concretely:
 - Every write destination derives from `target.volumeURL`. The source is touched only by `FileIndex.build`, `FileHandle(forReadingFrom:)`, `destinationOfSymbolicLink`, `fileExists`, and `dd`'s `if=`.
 - **Never add a repair/format/fix feature that writes to the source.** When a source is damaged, detect it, explain it, and hand off to Disk Utility (`PreflightView.openDiskUtility`). This was a deliberate design decision, not an oversight.
+- **Erasing a *backup* drive, added 2026-08-19, is not an exception to that.** It is target-side only, and the refusal is structural rather than a check someone has to remember: `FormatPreflight` blocks the source's own volume *and* any volume sharing the source's physical disk, and `DriveFormatter.erase` takes an `EraseApproval` — a token only `FormatPreflight.approve` can mint, and only when nothing is blocking. There is no other way to spell the argument, so there is no unchecked entry point to add a caller to by mistake.
 - `FilesystemCheck` is the one deliberate stretch of "read-only": `diskutil verifyVolume` runs `fsck_msdos -n`, which cannot write, but it *does* unmount and remount the volume. That's why it runs during analysis, before anything has been written anywhere, and why it re-checks that the volume came back.
 - If you touch `FileSyncEngine` or `BlockCloneEngine`, re-run the read-only-mount test below.
 
@@ -90,6 +101,10 @@ Model/
   DriveRecord        what's remembered about a drive between launches (Codable)
   Endpoint           one end of a copy: a drive, or a .sparseimage file
   ImagePreflight     the image-only preflight rules, kept pure so they're tested
+  DiskFormat         exFAT | FAT32 — diskutil's spelling, the limits, MBR
+  FormatPreflight    the erase rules, and EraseApproval, the token that gates them
+  AppVersion         dotted version, comparable — 1.10 is newer than 1.9
+  UpdateRelease      one GitHub release parsed; the "is this newer" decision
   CloneError         user-facing error copy
 Services/
   DriveScanner       volume enumeration, eligibility filter, mount watching
@@ -102,6 +117,9 @@ Services/
   DiskImageStore     hdiutil wrapper: create/attach/detach/reap .sparseimage
   DriveRegistryStore Codable persistence for DriveRecord; owns all the rules
   DriveRegistry      @Observable main-actor wrapper; decides when to write
+  DriveFormatter     diskutil eraseDisk wrapper — unprivileged, target-only
+  UpdateInstaller    fetch, download, pin the signature, swap the bundle, relaunch
+  UpdateController   @Observable: once-a-day check, skip-this-version memory
   Notifier           completion notification, degrades to beep
 Views/
   ContentView        routes on CloneJob.phase; cross-fades between them
@@ -109,6 +127,8 @@ Views/
                      CapacityBar, StatTile/StatRow, NoticeBox, AppIconBadge
   DrivePickerView / PreflightView / CloneProgressView / SummaryView
   ComparisonView     Compare's results screen; the one page with no next step
+  FormatDriveView    the erase sheet, opened from the destination list
+  UpdateSheet        the update sheet; six states, never on screen uninvited
   Formatting         ByteFormat, DurationFormat, AgeFormat
 ```
 
@@ -117,6 +137,8 @@ Flow: `idle → analyzing → preflight → running → verifying → finished |
 Compare short-circuits that: `idle → analyzing → comparison`, and stops. It reaches no write path at all — `start()` refuses `mode.isInspection` outright, and analysis calls only `FileSyncEngine.makePlan`, which is two `FileIndex.build` calls plus an in-memory diff.
 
 Engines run on a detached `Task` and publish progress back to the MainActor. `CloneJob` is `@MainActor @Observable`.
+
+Erasing and updating deliberately sit **outside** that phase machine. Neither is a copy, neither has a preflight → run → verify shape, and threading them through `CloneJob` would mean every phase switch in the app growing two cases that aren't about copying anything. The erase is a sheet over the picker with its own three states; the update is a sheet the app owns, held back by `ContentView` while a copy is in flight.
 
 ---
 
@@ -174,17 +196,45 @@ As vendor guidance rather than an observation here: exFAT *device library* suppo
 
 **The image attachment outlives a single `defer` scope.** It spans two detached Tasks — analysis and the copy — with the preflight screen in between, so release is funnelled through `CloneJob.setPhase` on every terminal phase, plus `reset()`. `DiskImageStore.reapStaleMounts()` at launch is the backstop for the one path nothing can cover: the app being killed mid-run, which otherwise leaves a mount that makes the *same* image fail to attach later with a confusing "resource busy".
 
+**Erasing is target-only, and the type is what says so rather than a comment.** `DriveFormatter.erase` takes an `EraseApproval` and nothing else. `EraseApproval`'s initializer is `fileprivate` to `FormatPreflight.swift`, so `FormatPreflight.approve(_:)` is the only thing in the app that can produce one, and it returns `nil` whenever `evaluate` produced a blocker. The disabled Erase button is the visible half of that; the token is the half that still holds if the button is ever mis-wired or a second caller appears. If you find yourself wanting to construct an approval somewhere else, that is the mistake this shape exists to catch.
+
+**The erase rewrites the whole disk, with an MBR partition map.** `eraseVolume` would remake the filesystem inside the partition it found and leave the partition scheme alone — which is useless for the case that actually brings someone here, a stick that mounts perfectly on a Mac and shows nothing on a CDJ because it is GPT or has an EFI slice in front of it. MBR because Pioneer's documentation is written against MBR FAT32/exFAT and macOS reads MBR without complaint, so the conservative choice costs nothing. The consequence is that *every* partition on the physical disk goes, which is why `FormatPreflight` enumerates them and names them in a warning, and why the source's whole-disk BSD name is a blocker and not just its volume path.
+
+**Nothing in the erase path is privileged, and that is a decision to defend.** Measured 2026-08-19: `diskutil eraseVolume` and a whole-disk `diskutil eraseDisk` both exit 0 with no authentication prompt against an attached disk image, and DiskArbitration authorizes the console user for external removable media, which is the only kind of volume `DriveScanner` ever produces. So there is no `osascript`-with-administrator-privileges path here and there must not be one added: a root shell script that erases a disk is a far worse thing for this project to own than an error message, and the honest fallback when `diskutil` refuses is the "Open Disk Utility…" button already on the sheet. Same reasoning as `DiskImageStore`, and the header of `DriveFormatter` says so where someone would go looking.
+
+**There is no cancel on an erase.** A `dd` killed halfway leaves a target the user can still recognise as broken — `CloneJob.finishInterrupted` says exactly that. A repartition killed halfway leaves a disk with no partition map at all. The operation takes a few seconds, so the honest interface is a disabled Cancel button with a tooltip, not a race.
+
+**FAT32's 2 TB ceiling is a blocker, checked before anything starts.** `newfs_msdos` refuses a disk larger than 2^32 sectors — but `diskutil eraseDisk` rewrites the partition map *first* and formats *second*, so hitting the limit leaves a disk with a fresh partition map and no filesystem. Catching it in `FormatPreflight` costs one comparison; not catching it costs the user their drive.
+
+**The update's security boundary is one `codesign -R` requirement, and everything else is downstream of it.** The feed is JSON from the network, and the DMG is whatever URL that JSON named. Nothing is executed, moved, or believed to be ThumbPrint until `UpdateInstaller.verify` has confirmed the downloaded bundle satisfies `anchor apple generic and identifier "com.saschanowlin.ThumbPrint" and certificate leaf[subject.OU] = "DPLC4BD7ST"` — Apple's chain, this identifier, this team. Verified 2026-08-19 in both directions: the requirement passes against the shipped 1.0 and fails against an unrelated Apple binary. Gatekeeper (`spctl --assess`) and a version match against the feed are checked too, but they are corroboration; the requirement is the thing that makes a substituted download unusable.
+
+**No Sparkle, and that is considered rather than lazy.** Sparkle would bring an EdDSA appcast, a second signing key to keep safe, and the project's first dependency. What it buys over ~400 lines here is delta updates and an installer XPC service, neither of which matters for a 2 MB notarized app distributed through one channel. If the app ever grows past that, revisit — but revisit with those two specific gains in mind.
+
+**The updater refuses to replace an app running from a build folder.** `UpdateInstaller.destination` returns `.revealOnly` for any bundle path containing `/DerivedData/` or `/Build/Products/`, and for any bundle whose parent directory isn't writable. The second is practical — replacing it would need a password, and this feature is not worth a privileged helper. The first is about not doing something startling: `Scripts/build.sh` runs the app from exactly there, and silently swapping a freshly compiled debug build for the public release is a genuinely confusing thing to do to someone mid-session. Both fall back to leaving the verified DMG in ~/Downloads.
+
+**`AppVersion` exists because string ordering puts "1.10" before "1.9".** That is a bug that only bites once and then never gets a chance to correct itself: the app would decide it was already current and stop offering the newer build forever. Component-wise numeric comparison, with a missing component read as zero so `1.0` and `1.0.0` are one version rather than two.
+
+**The relaunch waits on the old process's PID before calling `open`.** `open` on a bundle whose previous process is still running activates *that* process rather than starting the new one — so without the wait the user watches the app they just replaced come back. Polling `kill -0` from a detached `/bin/sh` and then opening is the one form of this that needs no helper tool.
+
+**`UpdateInstaller.install` only deletes a temp directory it recognises as its own.** The obvious spelling of the cleanup — remove the folder the DMG was in — would delete whatever directory a future caller happened to hand it a disk image from. It checks for the `thumbprint-update-` prefix under `NSTemporaryDirectory()` before removing anything. Caught while testing the install path against a DMG in `dist/`.
+
+**The update sheet is held back while a copy is running.** `UpdateController` decides *whether* there is anything to say; `ContentView.presentingUpdate` decides *when* it may be said, and the answer is never during `analyzing` or `running`. An update prompt over a backup in flight would be the app interrupting the only job it has. The automatic check is silent in every other outcome too — offline, rate-limited, up to date, or a version the user already skipped.
+
 ---
 
 ## Testing
 
 There's no XCTest target. The meaningful failure modes are hardware and filesystem behaviours that unit tests can't reach, so testing is done against **real filesystems on disk images**.
 
-**`./Tests/run.sh` is the suite.** It creates two throwaway exFAT images and two APFS fixture trees inside a temp directory, compiles `Tests/main.swift` against the Foundation-only sources, runs 124 checks, and tears all of it down on exit — including on failure. Exit 0 means everything passed; new checks go in `Tests/main.swift`. It writes nothing inside the repo and touches no real drive.
+**`./Tests/run.sh` is the suite.** It creates two throwaway exFAT images and two APFS fixture trees inside a temp directory, compiles `Tests/main.swift` against the Foundation-only sources, runs 194 checks, and tears all of it down on exit — including on failure. Exit 0 means everything passed; new checks go in `Tests/main.swift`. It writes nothing inside the repo and touches no real drive.
 
 As of the disk-image work the suite **does** compile and drive `FileSyncEngine` and `Verifier`, including a full save-to-image and restore-from-image round trip. That widening was deliberate: the whole risk of the feature is the boundary between the mirror and a mounted image, and that boundary is only worth anything if a copy actually crosses it. `BlockCloneEngine` and `FilesystemCheck` are still not driven by the suite.
 
-One caveat worth knowing: the disk-image checks use the real `DiskImageStore.mountRoot` (`~/Library/Application Support/ThumbPrint/mounts`), so `reapStaleMounts` runs against it. Don't run the suite while the app has an image open — it would detach it. Nothing else outside the temp directory is touched, and no image file is ever deleted.
+The erase checks (§ N) go further than the rest: they run a real `diskutil eraseDisk` — the same command a USB stick would get — against a throwaway sparse image the suite made, and assert the volume comes back renamed, reformatted and empty. That is deliberate. `FormatPreflight`'s rules can be driven on paper, but "is the command spelled correctly and does the volume return" cannot, and it is the half that would strand someone with an unformatted drive.
+
+Two caveats worth knowing. The disk-image checks use the real `DiskImageStore.mountRoot` (`~/Library/Application Support/ThumbPrint/mounts`), so `reapStaleMounts` runs against it — don't run the suite while the app has an image open, it would detach it. And a repartitioned image remounts at `/Volumes/<name>`, nowhere near the temp directory, so the cleanup in `run.sh` matches attached images on their **image path** as well as their mount point. Nothing else outside the temp directory is touched, and no image file is ever deleted.
+
+The update checks are pure: version comparison, feed parsing, the pinned requirement's text, and the build-folder refusal. The network fetch and the bundle swap are *not* in the suite — one needs GitHub and the other needs an installed app to replace. Both were exercised from throwaway CLI harnesses on 2026-08-19 (see [Status](#status)); if either changes, that is the way to re-prove it.
 
 The recipe below is the manual version, for testing something the suite doesn't cover yet — anything involving `BlockCloneEngine` or `FilesystemCheck`, neither of which the suite drives.
 
@@ -246,6 +296,19 @@ Working and verified: drive detection (against real USB hardware), file-level mi
 
 **Export staleness and Compare, verified 2026-08-12** by a harness over two throwaway exFAT images plus two APFS directories — 32 checks, all passing. Covered: a stale library (one track 9 days past the export, correctly the only one flagged, with the note naming the gap and the database path), a fresh library producing no note, audio with no library at all, the three-way file diff (left-only / right-only / differing / identical) against a real ±2s FAT mtime, `ComparisonReport`'s cross-drive library-asymmetry note, and a drive compared with itself reporting identical. Neither feature has been run against real DJ hardware yet, and no comparison has been made between two *large* real libraries — the 81 GB `HOTFIRE` case would be the honest test of the list caps in `ComparisonView`.
 
+**Erasing a backup drive, built 2026-08-19.** `DiskFormat` + `FormatPreflight` + `DriveFormatter` + `FormatDriveView`, reachable from one row at the bottom of the destination list, and only ever for the drive already chosen as the destination. Whole-disk `diskutil eraseDisk` to exFAT or FAT32 with an MBR partition map, unprivileged, with the source refused two ways. Covered by 34 harness checks: every refusal (the source volume, another partition of the source's disk, no disk device, read-only media, FAT32 over 2 TB, a selected disk image living on the drive), the component-wise containment that keeps `/Volumes/BACKUP` from looking like `/Volumes/BACKUPDJ`, the volume-label sanitizing shared with the image feature, and **a real `diskutil eraseDisk` against a throwaway sparse image** that comes back renamed, reformatted FAT32, empty and writable. Not yet run against a real USB stick, and no erased stick has been loaded in a CDJ — that is the honest test and it hasn't happened.
+
+**Update check and apply, built 2026-08-19.** `AppVersion` + `UpdateRelease` + `UpdateInstaller` + `UpdateController` + `UpdateSheet`. A silent once-a-day check against `api.github.com/repos/elDoof/ThumbPrint/releases/latest`, a sheet only when there is genuinely something newer that hasn't been skipped, and "Check for Updates…" in the app menu for the manual case. 36 harness checks cover version comparison, feed parsing and its four refusals, asset selection, the pinned requirement's text and the build-folder refusal.
+
+The two halves the harness can't reach were proven from throwaway CLI harnesses the same day, and this is what was actually observed:
+
+- The live fetch returns `v1.0`, parses to one `ThumbPrint-1.0.dmg` asset of 2,411,354 bytes, and correctly reports itself as *not* newer than a 1.0 install and newer than a 0.9 one.
+- The pinned requirement **accepts** the installed, notarized 1.0 and **rejects** `/System/Applications/Calculator.app` — it discriminates in both directions, which a requirement that merely always passed would not.
+- The version pin refuses a bundle offered as 9.9 that contains 1.0.
+- A full `install` against a scratch copy of the app, using the real notarized `dist/ThumbPrint-1.0.dmg`: the copy was replaced, a marker file planted inside it was gone afterwards, the replaced bundle still satisfied the pinned requirement, no staging directory was left behind, and the DMG's own directory was correctly *not* deleted.
+
+What remains unproven is the one thing that needs a newer release to exist: nobody has clicked **Install and Relaunch** in the running app and watched it come back.
+
 **Read-only-mount test:** re-run 2026-08-11 after the `autoreleasepool` fix touched `FileSyncEngine` and `FileIndex`. A full 2 GB / 1,512-file sync from a source attached with `hdiutil attach -readonly` completed and verified with 0 discrepancies, and a before/after `stat` snapshot of 3,030 user files was byte-identical. The only source-side delta was macOS's own `.fseventsd` journal, flushed by the OS at unmount — a path `FileIndex` excludes and never reads.
 
 **Performance, so it isn't re-litigated:** a 45-minute 18.2 GB backup was traced to the *source drive*, not this code — ~23% of large files read at 1.2–3.5 MB/s (fragmentation; unchanged by a successful `fsck` repair) while the rest read at 43–75 MB/s and the target writes 46 MB/s. Measured and **disproven** as causes: the per-file `fsync` (no gain, so its crash-safety is free), pipelining reads against writes (0.80×, a regression), the tree walks (0.3 s total), and mtime stamping (~1 ms/file). The only real software win found was 3–4 concurrent file copies (1.9× on large files), deliberately deferred until a healthy source exists to baseline against.
@@ -279,6 +342,8 @@ Decisions worth keeping:
 **Pre-gig readiness check** — next, and now unblocked: the registry already stores `SyncRecord.averageBytesPerSecond` per drive, which is the history half of the throughput signal. One read-only button bundling `FilesystemCheck`, free space, export staleness, and a read-throughput sample into a green/amber/red verdict. The throughput sample earns its place from measurement already in this repo: 23% of large files on a fragmented source read at 1.2–3.5 MB/s against 43–75 MB/s for the rest, which on a CDJ is a track that takes visibly long to load. Sampled per drive over time it also detects failing flash.
 
 **Library-aware verification** (bigger, and the real differentiator). `Verifier` proves the bytes copied; it does not prove the drive will *load*. Parsing the target's library database closes that gap: rows in `export.pdb` whose file is missing (shows in the player, won't play), audio on the drive no row references (invisible on the player, often gigabytes), and a playlist diff between runs. The `.pdb` and Serato `database V2` layouts are community reverse-engineering (Deep Symmetry's crate-digger), not vendor documentation — **verify against the live `HOTFIRE` tree before building on any structural claim.** Parsing is read-only, so the one rule is unaffected.
+
+**Erase from the preflight screen, not just the picker.** The moment someone most wants to reformat a backup drive is the moment preflight says "“BACKUPDJ” is APFS — the copy will work, but the drive may not be readable by a CDJ", and today that means going Back and finding the row. It was left out of 1.1 for a real reason rather than laziness: erasing invalidates the analysis the screen is showing, so the route has to end in `job.reset()` and a re-analysis, and wiring a destructive action into a screen whose whole job is to be the last calm moment before one deserves its own think. Cheap, but not free.
 
 Smaller, all cheap: auto-sync prompt on plug-in (`DriveScanner` already watches mounts); N-way fan-out to 2–3 targets reading the source once; a format-mismatch note in preflight from the player-support matrix already written down above; opt-in content-hash verify with per-drive caching, which catches silent bit-rot that size+mtime cannot; and space planning that names the biggest folders instead of just blocking.
 

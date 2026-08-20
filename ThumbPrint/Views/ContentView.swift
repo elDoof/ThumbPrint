@@ -1,6 +1,10 @@
 import SwiftUI
 
 struct ContentView: View {
+    /// Owned by the app, not by this view — the menu's "Check for Updates…"
+    /// reaches the same instance.
+    let updates: UpdateController
+
     @State private var scanner = DriveScanner()
     @State private var job = CloneJob()
 
@@ -66,6 +70,9 @@ struct ContentView: View {
             )
         )
         .animation(.easeOut(duration: 0.22), value: phaseID)
+        .sheet(isPresented: presentingUpdate) {
+            UpdateSheet(controller: updates)
+        }
         .task {
             // If the app was killed while a disk image was open, the mount
             // survives the process — invisible in Finder, and enough to make the
@@ -76,6 +83,11 @@ struct ContentView: View {
                 _ = DiskImageStore.reapStaleMounts()
             }
             await reap.value
+
+            // Silent unless there's a newer version, and at most once a day.
+            // Deliberately after the reap: a stale mount is the app's own mess
+            // to clean up before it starts talking about anything else.
+            updates.checkOnLaunch()
         }
         .onChange(of: scanner.drives) { _, drives in
             // Every sighting, regardless of phase: this is how a drive that is
@@ -88,6 +100,18 @@ struct ContentView: View {
                 job.dropMissingDrives(available: drives)
             }
         }
+    }
+
+    /// The update sheet waits for the app to be doing nothing.
+    ///
+    /// An update prompt appearing over a running backup would be this app
+    /// interrupting the only job it has. The controller decides *whether* there
+    /// is something to say; this decides *when* it may be said.
+    private var presentingUpdate: Binding<Bool> {
+        Binding(
+            get: { updates.isPresenting && !job.isBusy },
+            set: { if !$0 { updates.dismiss() } }
+        )
     }
 
     /// Identity of the current phase, ignoring its payload. `Phase` carries
