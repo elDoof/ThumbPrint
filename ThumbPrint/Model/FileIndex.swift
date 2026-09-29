@@ -155,6 +155,31 @@ struct SyncPlan {
     var isEmpty: Bool {
         directoriesToCreate.isEmpty && filesToCopy.isEmpty && itemsToDelete.isEmpty
     }
+
+    /// FAT32 stores a file's length in 32 bits: 4 GiB less one byte is the most
+    /// a single file can be. exFAT has no such limit.
+    static let fat32MaximumFileSize: Int64 = 4 * 1024 * 1024 * 1024 - 1
+
+    /// Takes out of the plan, and returns, the files a FAT32 target can't hold.
+    ///
+    /// Left in, each one would copy 4 GB into a temp file, fail with EFBIG, and do
+    /// it again on every run — and the free-space check would count bytes that
+    /// can never land. Taken out, preflight can name them and the summary reports
+    /// them as skipped, which is the truth: this backup doesn't contain them.
+    mutating func removeFilesTooLarge(forTargetFormat formatDescription: String) -> [FileIndex.Entry] {
+        guard DiskFormat.matching(formatDescription) == .fat32 else { return [] }
+        let tooLarge = filesToCopy.filter { $0.size > Self.fat32MaximumFileSize }
+        guard !tooLarge.isEmpty else { return [] }
+        filesToCopy.removeAll { $0.size > Self.fat32MaximumFileSize }
+        return tooLarge
+    }
+
+    /// The line each of those files gets in the summary's skipped list. The
+    /// " — " separator is what `Verifier` splits on to recognise a path it was
+    /// told about, so this reads as skipped rather than missing.
+    static func tooLargeNote(for entry: FileIndex.Entry) -> String {
+        "\(entry.relativePath) — \(ByteFormat.string(entry.size)), larger than the 4 GB a FAT32 drive can store in one file"
+    }
 }
 
 /// A two-way difference between drives, for inspection rather than copying.

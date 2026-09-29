@@ -173,8 +173,11 @@ struct PreflightView: View {
                     .keyboardShortcut(.defaultAction)
                     .controlSize(.large)
             } else {
+                // Return starts a Fast Sync — this screen is its confirmation.
+                // Not an Exact Clone: that erases the drive outright, and a
+                // stray Return shouldn't be what does it.
                 Button(startTitle, action: onStart)
-                    .keyboardShortcut(.defaultAction)
+                    .keyboardShortcut(report.mode == .exactClone ? nil : .defaultAction)
                     .disabled(!report.canProceed)
                     .controlSize(.large)
             }

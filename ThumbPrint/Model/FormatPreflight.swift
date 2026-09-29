@@ -214,7 +214,8 @@ struct FormatPreflight {
             format: facts.format,
             volumeName: sanitizedName(facts.requestedName, format: facts.format),
             driveName: facts.drive.name,
-            previousVolumePath: facts.drive.volumeURL.path
+            previousVolumePath: facts.drive.volumeURL.path,
+            volumeUUID: facts.drive.volumeUUID
         )
     }
 
@@ -248,23 +249,38 @@ struct EraseApproval: Equatable {
     let format: DiskFormat
     let volumeName: String
 
-    /// Carried for messages only. The volume's path stops existing the moment
-    /// the erase begins.
     let driveName: String
+
+    /// Where the approved volume was mounted and what it was, so `DriveFormatter`
+    /// can confirm the disk is still that drive in the instant before it erases.
+    /// The BSD name alone can't: macOS reuses `disk4` for whatever is plugged in
+    /// next. See `stillDescribes(_:)`.
     let previousVolumePath: String
+    let volumeUUID: String?
 
     fileprivate init(
         wholeDiskBSDName: String,
         format: DiskFormat,
         volumeName: String,
         driveName: String,
-        previousVolumePath: String
+        previousVolumePath: String,
+        volumeUUID: String?
     ) {
         self.wholeDiskBSDName = wholeDiskBSDName
         self.format = format
         self.volumeName = volumeName
         self.driveName = driveName
         self.previousVolumePath = previousVolumePath
+        self.volumeUUID = volumeUUID
+    }
+
+    /// Whether `current` — the drive mounted at `previousVolumePath` now — is the
+    /// drive this approval was granted for. `nil` (nothing mounted there) is a
+    /// refusal: the drive was unplugged, and whatever holds its disk number now
+    /// is not something anyone approved erasing.
+    func stillDescribes(_ current: Drive?) -> Bool {
+        guard let current else { return false }
+        return current.wholeDiskBSDName == wholeDiskBSDName && current.volumeUUID == volumeUUID
     }
 
     var deviceNode: String { "/dev/\(wholeDiskBSDName)" }

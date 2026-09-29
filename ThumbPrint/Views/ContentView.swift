@@ -5,8 +5,10 @@ struct ContentView: View {
     /// reaches the same instance.
     let updates: UpdateController
 
+    /// Also owned by the app, so a copy outlives its window. See `ThumbPrintApp`.
+    let job: CloneJob
+
     @State private var scanner = DriveScanner()
-    @State private var job = CloneJob()
 
     /// Not `@State`: the registry outlives any view and is shared with `CloneJob`,
     /// which reaches it directly. Observation still tracks the reads in `body`.
@@ -23,6 +25,7 @@ struct ContentView: View {
                     progress: job.progress,
                     sourceName: job.sourceDisplayName,
                     targetName: job.targetDisplayName,
+                    cancelConsequence: job.cancelConsequence,
                     onCancel: { job.cancel() }
                 )
 
@@ -94,11 +97,15 @@ struct ContentView: View {
             // only ever a backup target still accumulates a history.
             registry.noteSeen(drives)
 
-            // Only meaningful while idle — mid-clone the engines detect a
-            // disconnect themselves and fail with a specific error.
+            // Mid-copy the engines detect a disconnect themselves and fail with a
+            // specific error; while idle the selection is simply dropped.
             if case .idle = job.phase {
                 job.dropMissingDrives(available: drives)
             }
+
+            // On preflight too: the report and its Start button describe two
+            // specific drives, and one of them just went away.
+            job.abandonPreflightIfDrivesMissing(available: drives)
         }
     }
 

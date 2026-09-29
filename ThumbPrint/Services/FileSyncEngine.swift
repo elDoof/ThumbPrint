@@ -140,9 +140,25 @@ final class FileSyncEngine {
             try ensureMounted(source: source, target: target)
 
             let url = target.volumeURL.appendingPathComponent(entry.relativePath)
-            if !fm.fileExists(atPath: url.path) {
-                try fm.createDirectory(at: url, withIntermediateDirectories: true)
-                result.foldersCreated += 1
+            var isDirectory: ObjCBool = false
+            let exists = fm.fileExists(atPath: url.path, isDirectory: &isDirectory)
+
+            // Per folder, like files: one folder the target refuses shouldn't
+            // abort a two-hour backup. Its files then fail individually and are
+            // reported, rather than the run ending at "Creating folders…".
+            do {
+                if exists && !isDirectory.boolValue {
+                    // The source has a folder where the backup has a file. The
+                    // plan already asked for a folder here; without clearing the
+                    // file first, every track inside it fails on every run.
+                    try fm.removeItem(at: url)
+                }
+                if !exists || !isDirectory.boolValue {
+                    try fm.createDirectory(at: url, withIntermediateDirectories: true)
+                    result.foldersCreated += 1
+                }
+            } catch {
+                result.skipped.append("\(entry.relativePath) — couldn't create this folder: \(error.localizedDescription)")
             }
 
             publish { $0.itemsCompleted = offset + 1; $0.currentItem = entry.relativePath }
@@ -191,6 +207,15 @@ final class FileSyncEngine {
                     throw CancellationError()
                 } catch let error as CloneError {
                     throw error
+                } catch where Self.isOutOfSpace(error) {
+                    // A full drive is not a per-file problem. Carrying on would
+                    // write and discard a temp file for every remaining track and
+                    // end in thousands of identical "skipped" lines.
+                    let remaining = files[offset...].reduce(Int64(0)) { $0 + $1.size }
+                    let available = (try? target.volumeURL.resourceValues(
+                        forKeys: [.volumeAvailableCapacityKey]
+                    ).volumeAvailableCapacity).flatMap { $0 }.map(Int64.init) ?? 0
+                    throw CloneError.outOfSpace(needed: remaining, available: available)
                 } catch {
                     // One unreadable track shouldn't abort a two-hour backup, but it
                     // must be reported — a silently missing file is exactly the
@@ -281,7 +306,19 @@ final class FileSyncEngine {
 
     // MARK: - Helpers
 
-    private func ensureMounted(source: Drive, target: Drive) throws {
+    /// ENOSPC arrives as a Cocoa write error, a POSIX error, or one wrapped in
+    /// the other, depending on which call hit it.
+    static func isOutOfSpace(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileWriteOutOfSpaceError { return true }
+        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOSPC) { return true }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error { return isOutOfSpace(underlying) }
+        return false
+    }
+
+    /// Also called by `CloneJob` before verification, so a drive pulled during
+    /// the last file reads as "disconnected" rather than "every file missing".
+    func ensureMounted(source: Drive, target: Drive) throws {
         let fm = FileManager.default
         guard fm.fileExists(atPath: source.volumeURL.path) else {
             throw CloneError.sourceDisappeared(source.name)

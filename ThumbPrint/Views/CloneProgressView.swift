@@ -4,7 +4,13 @@ struct CloneProgressView: View {
     let progress: CloneProgress
     let sourceName: String
     let targetName: String
+    /// Nil while analysing, when stopping costs nothing and is simply done.
+    /// Once writing has begun, Cancel — and Esc, which is bound to it — asks
+    /// first, because the answer is different for each mode.
+    let cancelConsequence: String?
     let onCancel: () -> Void
+
+    @State private var confirmingCancel = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.sectionSpacing) {
@@ -170,9 +176,21 @@ struct CloneProgressView: View {
 
             Spacer()
 
-            Button("Cancel", action: onCancel)
-                .keyboardShortcut(.cancelAction)
-                .controlSize(.large)
+            Button("Cancel") {
+                if cancelConsequence == nil { onCancel() } else { confirmingCancel = true }
+            }
+            .keyboardShortcut(.cancelAction)
+            .controlSize(.large)
+        }
+        .confirmationDialog(
+            "Stop the copy?",
+            isPresented: $confirmingCancel,
+            titleVisibility: .visible
+        ) {
+            Button("Stop Copying", role: .destructive, action: onCancel)
+            Button("Keep Going", role: .cancel) {}
+        } message: {
+            Text(cancelConsequence ?? "")
         }
     }
 }

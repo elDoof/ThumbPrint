@@ -30,6 +30,7 @@ enum DriveFormatter {
         case diskBusy(String)
         case eraseFailed(String)
         case volumeDidNotReturn(String)
+        case driveChanged(String)
 
         var errorDescription: String? {
             switch self {
@@ -42,6 +43,8 @@ enum DriveFormatter {
                 return "The erase didn't finish.\(text)"
             case .volumeDidNotReturn(let name):
                 return "“\(name)” was erased but didn't come back. Unplug it and plug it in again — the drive should be there, freshly formatted."
+            case .driveChanged(let name):
+                return "“\(name)” isn't connected the way it was when this sheet opened — it may have been unplugged or swapped for another drive. Nothing was erased. Close this and choose the drive again."
             }
         }
     }
@@ -109,6 +112,14 @@ enum DriveFormatter {
     /// is to let it finish.
     @discardableResult
     static func erase(_ approval: EraseApproval, onStep: StepHandler? = nil) throws -> Drive {
+        // The approval names a disk number, and disk numbers are reused. Unplug
+        // the approved stick, plug in another, and the new one can be `disk4`
+        // too — so the drive is re-read from its mount point here, immediately
+        // before the command, rather than trusted from when the sheet opened.
+        guard approval.stillDescribes(currentDrive(atVolumePath: approval.previousVolumePath)) else {
+            throw Failure.driveChanged(approval.driveName)
+        }
+
         let result = runStreaming(
             "/usr/sbin/diskutil",
             [
@@ -167,6 +178,30 @@ enum DriveFormatter {
             }
         }
         return nil
+    }
+
+    /// What is mounted at `path` right now, with the physical disk macOS says it
+    /// sits on. `nil` when nothing is mounted there.
+    ///
+    /// Asked of `diskutil` rather than DiskArbitration so the harness can drive
+    /// it. `diskutil info` on a path that is merely a folder answers for the
+    /// volume *containing* it, so the reported mount point has to be the path
+    /// itself — otherwise a leftover `/Volumes/BACKUP` folder would come back as
+    /// the boot disk.
+    static func currentDrive(atVolumePath path: String) -> Drive? {
+        guard FileManager.default.fileExists(atPath: path),
+              let plist = plist(from: run("/usr/sbin/diskutil", ["info", "-plist", path])),
+              let wholeDisk = plist["ParentWholeDisk"] as? String, !wholeDisk.isEmpty,
+              let mountPoint = plist["MountPoint"] as? String,
+              canonicalPath(mountPoint) == canonicalPath(path)
+        else { return nil }
+        return drive(atMountPoint: path, wholeDiskBSDName: wholeDisk)
+    }
+
+    /// `/var/folders/…` and `/private/var/folders/…` are one place; `diskutil`
+    /// reports the second.
+    private static func canonicalPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     /// Reads the same resource values `DriveScanner` does, minus the eligibility

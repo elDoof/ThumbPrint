@@ -45,12 +45,25 @@ if (( NOTARIZE )); then
 fi
 echo "Signing identity and notary credentials present."
 
+# ------------------------------------------------------------------- tests --
+# Every release is also the update feed, so a regression here reaches every
+# installed copy the next day. The suite takes about a minute and touches no
+# real drive.
+step "Running the test suite"
+./Tests/run.sh >"${TMPDIR:-/tmp}/thumbprint-release-tests.log" 2>&1 \
+    || fail "the test suite failed — see ${TMPDIR:-/tmp}/thumbprint-release-tests.log"
+tail -1 "${TMPDIR:-/tmp}/thumbprint-release-tests.log"
+
 # -------------------------------------------------------------------- build --
 step "Building Release"
 
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
+# xcodebuild's own status is captured explicitly: the grep filter may match
+# nothing, and a failed build can still leave an .app folder behind that would
+# otherwise surface much later as a confusing codesign error.
+set +e
 xcodebuild \
     -project ThumbPrint.xcodeproj \
     -scheme ThumbPrint \
@@ -61,7 +74,10 @@ xcodebuild \
     DEVELOPMENT_TEAM="$TEAM_ID" \
     ENABLE_HARDENED_RUNTIME=YES \
     clean build \
-    | grep -E "error:|warning:|BUILD" || true
+    | grep -E "error:|warning:|BUILD"
+BUILD_STATUS=${PIPESTATUS[0]}
+set -e
+(( BUILD_STATUS == 0 )) || fail "xcodebuild failed (exit $BUILD_STATUS)"
 
 APP="$DIST/DerivedData/Build/Products/Release/ThumbPrint.app"
 [[ -d "$APP" ]] || fail "build did not produce $APP"

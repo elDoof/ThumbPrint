@@ -40,6 +40,11 @@ struct DrivePickerView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: Metrics.sectionSpacing) {
                     hero
+
+                    if let notice = job.disconnectNotice {
+                        NoticeBox(kind: .warning, text: notice)
+                    }
+
                     modePicker
 
                     if drives.isEmpty {

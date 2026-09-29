@@ -61,7 +61,10 @@ struct JobSession {
             let sourceDrive: Drive
             switch source {
             case .drive(let drive):
-                sourceDrive = drive
+                // Re-read, not trusted: the picker's `Drive` is from when the
+                // stick was plugged in, which may be before the export that
+                // this backup is for.
+                sourceDrive = drive.refreshingCapacity()
             case .image(let url):
                 let mountPoint = try DiskImageStore.makeMountPoint()
                 let attachment = try DiskImageStore.attach(url, readOnly: true, mountPoint: mountPoint)
@@ -72,7 +75,7 @@ struct JobSession {
             let targetDrive: Drive
             switch target {
             case .drive(let drive):
-                targetDrive = drive
+                targetDrive = drive.refreshingCapacity()
             case .image(let url):
                 var imageURL = url
                 if !FileManager.default.fileExists(atPath: url.path) {
@@ -183,9 +186,24 @@ final class CloneJob {
     /// failed screens.
     private(set) var targetWarning: String?
 
+    /// Set when a drive disappears from under the preflight screen and the job
+    /// goes back to the picker, so the picker can say why. Cleared on the next
+    /// analysis.
+    private(set) var disconnectNotice: String?
+
     private var task: Task<Void, Never>?
     private var cachedPlan: SyncPlan?
     private var cachedSourceIndex: FileIndex?
+
+    /// Files the plan left out because the target can't store them. Carried to
+    /// the summary as skipped, so the backup is never reported as complete
+    /// without them.
+    private var cachedTooLarge: [FileIndex.Entry] = []
+
+    /// Holds off idle sleep while a copy runs. A 45-minute backup on a laptop is
+    /// long enough for the Mac to sleep mid-copy, and a USB drive that sleeps
+    /// with it comes back as an I/O error. Display sleep is still allowed.
+    private var activity: NSObjectProtocol?
 
     /// The mounted volumes this run is actually operating on, established during
     /// analysis and held until the job reaches a terminal phase.
@@ -207,6 +225,20 @@ final class CloneJob {
         return true
     }
 
+    /// What stopping now would leave behind, for the confirmation that Cancel and
+    /// Quit both show. `nil` when nothing has been written yet.
+    var cancelConsequence: String? {
+        guard case .running = phase else { return nil }
+        switch mode {
+        case .exactClone:
+            return "“\(targetDisplayName)” is being overwritten block by block. Stopping now leaves it unreadable until it is cloned again or erased."
+        case .fastSync:
+            return "“\(targetDisplayName)” will be left part-way through updating. Nothing is lost — running the backup again finishes it."
+        case .compareOnly:
+            return nil
+        }
+    }
+
     var isBusy: Bool {
         switch phase {
         case .analyzing, .running: return true
@@ -224,7 +256,9 @@ final class CloneJob {
         progress = CloneProgress()
         cachedPlan = nil
         cachedSourceIndex = nil
+        cachedTooLarge = []
         targetWarning = nil
+        disconnectNotice = nil
 
         task = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
@@ -252,7 +286,8 @@ final class CloneJob {
                     let engine = FileSyncEngine { progress in
                         Task { @MainActor in self.progress = progress }
                     }
-                    let (plan, sourceIndex, targetIndex) = try engine.makePlan(source: source, target: target)
+                    var (plan, sourceIndex, targetIndex) = try engine.makePlan(source: source, target: target)
+                    let tooLarge = plan.removeFilesTooLarge(forTargetFormat: target.formatDescription)
                     try Task.checkCancellation()
 
                     // Deliberately after indexing rather than before: the check
@@ -294,9 +329,15 @@ final class CloneJob {
                         sourceIndex: sourceIndex,
                         targetIndex: targetIndex,
                         filesystemCheck: filesystemCheck,
-                        image: session.imageFacts(bytesToCopy: plan.bytesToCopy)
+                        image: session.imageFacts(bytesToCopy: plan.bytesToCopy),
+                        tooLargeForTarget: tooLarge
                     )
-                    await self.finishAnalysis(plan: plan, sourceIndex: sourceIndex, report: report)
+                    await self.finishAnalysis(
+                        plan: plan,
+                        sourceIndex: sourceIndex,
+                        tooLarge: tooLarge,
+                        report: report
+                    )
 
                 case .exactClone:
                     await self.setStage(.checkingSource, item: source.name)
@@ -311,7 +352,7 @@ final class CloneJob {
                         target: target,
                         filesystemCheck: filesystemCheck
                     )
-                    await self.finishAnalysis(plan: nil, sourceIndex: nil, report: report)
+                    await self.finishAnalysis(plan: nil, sourceIndex: nil, tooLarge: [], report: report)
 
                 case .compareOnly:
                     // Only the read-only half of the engine is used: `makePlan`
@@ -344,9 +385,9 @@ final class CloneJob {
                     )
                 }
             } catch is CancellationError {
-                await self.setPhase(.idle)
+                await self.endAnalysis(.idle)
             } catch {
-                await self.setPhase(.failed(error.localizedDescription))
+                await self.endAnalysis(.failed(error.localizedDescription))
             }
         }
     }
@@ -371,11 +412,16 @@ final class CloneJob {
         let mode = self.mode
         let plan = cachedPlan
         let sourceIndex = cachedSourceIndex
+        let tooLargeNotes = cachedTooLarge.map(SyncPlan.tooLargeNote(for:))
         let startedAt = Date()
 
         phase = .running
         progress = CloneProgress()
         targetWarning = nil
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled],
+            reason: "Backing up a drive"
+        )
 
         task = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
@@ -399,12 +445,14 @@ final class CloneJob {
                     )
 
                     try Task.checkCancellation()
-                    await self.beginVerification()
+                    try engine.ensureMounted(source: source, target: target)
+                    await self.beginVerification(fileCount: sourceIndex.entries.count)
 
+                    let skipped = result.skipped + tooLargeNotes
                     let verification = try Verifier.verify(
                         sourceIndex: sourceIndex,
                         targetVolume: target.volumeURL,
-                        skipped: result.skipped,
+                        skipped: skipped,
                         isCancelled: { Task.isCancelled },
                         onCount: { count in
                             // Verification walks the whole tree; forwarding
@@ -424,7 +472,7 @@ final class CloneJob {
                         bytesCopied: result.bytesCopied,
                         itemsDeleted: result.itemsDeleted,
                         foldersCreated: result.foldersCreated,
-                        skipped: result.skipped + result.unreadableOnSource.map { "\($0) — unreadable on source" },
+                        skipped: skipped + result.unreadableOnSource.map { "\($0) — unreadable on source" },
                         verification: verification
                     )
 
@@ -482,6 +530,7 @@ final class CloneJob {
         task = nil
         cachedPlan = nil
         cachedSourceIndex = nil
+        cachedTooLarge = []
         progress = CloneProgress()
         targetWarning = nil
         // Backing out of preflight without ever running: the image file we made
@@ -508,6 +557,27 @@ final class CloneJob {
 
         if !stillValid(source) { source = nil }
         if !stillValid(target) { target = nil }
+    }
+
+    /// Called when drives change while the preflight screen is up.
+    ///
+    /// The report on screen describes two specific drives, and Start acts on
+    /// them. If either has gone, the report is describing something that isn't
+    /// there — and for Exact Clone, a stick plugged in next can inherit the
+    /// vanished drive's disk number. So the job goes back to the picker and says
+    /// why, rather than leaving a Start button pointed at a stale plan.
+    func abandonPreflightIfDrivesMissing(available: [Drive]) {
+        guard case .preflight = phase else { return }
+        let ids = Set(available.map(\.id))
+        let missing = [source, target].compactMap { endpoint -> String? in
+            guard case .drive(let drive) = endpoint, !ids.contains(drive.id) else { return nil }
+            return drive.name
+        }
+        guard let name = missing.first else { return }
+
+        reset()
+        dropMissingDrives(available: available)
+        disconnectNotice = "“\(name)” was disconnected, so the check was discarded. Plug it back in and continue again."
     }
 
     // MARK: - Session lifetime
@@ -541,6 +611,10 @@ final class CloneJob {
             // Terminal for this run: let the image go. The file stays; only the
             // mount is released.
             releaseSession()
+            if let activity {
+                ProcessInfo.processInfo.endActivity(activity)
+                self.activity = nil
+            }
         case .analyzing, .preflight, .running:
             break
         }
@@ -664,18 +738,37 @@ final class CloneJob {
         )
     }
 
-    private func finishAnalysis(plan: SyncPlan?, sourceIndex: FileIndex?, report: PreflightReport) {
+    private func finishAnalysis(
+        plan: SyncPlan?,
+        sourceIndex: FileIndex?,
+        tooLarge: [FileIndex.Entry],
+        report: PreflightReport
+    ) {
         cachedPlan = plan
         cachedSourceIndex = sourceIndex
+        cachedTooLarge = tooLarge
         phase = .preflight(report)
     }
 
-    private func beginVerification() {
+    /// Analysis that stops short of preflight — cancelled or failed — never
+    /// wrote anything, so an image file it created is still empty and goes, as
+    /// it would from `reset()`. Otherwise cancelling a save leaves a mystery
+    /// `.sparseimage` in the folder the user picked.
+    private func endAnalysis(_ newPhase: Phase) {
+        releaseSession(deletingCreatedImage: true)
+        setPhase(newPhase)
+    }
+
+    /// Verification re-reads every file, so the bar counts files rather than
+    /// sitting at zero, and the copy's last speed reading is cleared rather than
+    /// left on screen describing work that has finished.
+    private func beginVerification(fileCount: Int) {
         progress.stage = .verifying
         progress.itemsCompleted = 0
-        progress.itemsTotal = 0
+        progress.itemsTotal = fileCount
         progress.bytesTotal = 0
         progress.bytesCompleted = 0
+        progress.bytesPerSecond = 0
         progress.currentItem = ""
     }
 }

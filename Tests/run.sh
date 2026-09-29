@@ -116,6 +116,11 @@ echo "==> Compiling harness"
 # update checks pin the pinned-signature requirement and the feed parsing. The
 # network half of `UpdateInstaller` is compiled but never called.
 #
+# `PreflightReport` is in as of 1.3, so the Exact Clone and FAT32 rules can be
+# checked directly. It needs `SourceHealthCheck`, `FilesystemCheck` and
+# `BlockCloneEngine` to compile; the last two are compiled but never run here —
+# one unmounts the volume it checks, the other asks for an admin password.
+#
 # `DriveRegistry`, `DriveScanner` and `UpdateController` stay out — they're the
 # @MainActor @Observable wrappers, which is why every rule worth testing lives in
 # a value type instead.
@@ -124,6 +129,8 @@ swiftc -o "$WORK/harness" \
     "$TP"/Model/{DiskFormat,FormatPreflight,AppVersion,UpdateRelease}.swift \
     "$TP"/Services/{LibraryCheck,DriveRegistryStore,DiskImageStore,FileSyncEngine,Verifier}.swift \
     "$TP"/Services/{DriveFormatter,UpdateInstaller}.swift \
+    "$TP"/Model/PreflightReport.swift \
+    "$TP"/Services/{SourceHealthCheck,FilesystemCheck,BlockCloneEngine}.swift \
     "$TP"/Views/Formatting.swift \
     "$ROOT/Tests/main.swift" || exit 2
 

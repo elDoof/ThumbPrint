@@ -12,6 +12,7 @@ enum CloneError: LocalizedError {
     case authorizationCancelled
     case privilegedTaskFailed(String)
     case rawCopyFailed(exitCode: Int32, message: String)
+    case driveChanged(String)
 
     var errorDescription: String? {
         switch self {
@@ -48,6 +49,9 @@ enum CloneError: LocalizedError {
         case .rawCopyFailed(let exitCode, let message):
             let detail = message.isEmpty ? "" : "\n\n\(message)"
             return "The disk copy failed (exit code \(exitCode)).\(detail)"
+
+        case .driveChanged(let name):
+            return "“\(name)” isn't connected the way it was when it was checked — it may have been unplugged or swapped for another drive. Nothing was written. Go back and choose the drives again."
         }
     }
 }

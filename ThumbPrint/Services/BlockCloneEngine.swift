@@ -31,6 +31,17 @@ final class BlockCloneEngine {
             throw CloneError.exactCloneUnavailable
         }
 
+        // The BSD names above were read at preflight, and macOS reuses them: swap
+        // the backup stick while the preflight screen is up and the new one can
+        // come back as the same `disk4`. A raw clone onto the wrong disk is the
+        // worst thing this app could do, so both drives are re-read and must
+        // still be the same volume on the same disk before anything is unmounted.
+        for drive in [target, source] {
+            guard drive.isSameDisk(as: DriveFormatter.currentDrive(atVolumePath: drive.volumeURL.path)) else {
+                throw CloneError.driveChanged(drive.name)
+            }
+        }
+
         let sourceSize = try Self.wholeDiskSize(bsdName: sourceBSD)
         let targetSize = try Self.wholeDiskSize(bsdName: targetBSD)
 
@@ -135,8 +146,11 @@ final class BlockCloneEngine {
     /// SECURITY: the script here is executed as root, so its directory is 0700
     /// and the script itself 0500. Never relax these, and never place it
     /// somewhere world-writable such as /tmp — a writable path would let
-    /// another local process swap the script's contents between creation and
-    /// execution and get root.
+    /// another user's process swap the script's contents between creation and
+    /// execution and get root. The modes guard against *other users* only: a
+    /// process already running as this user owns the directory and could still
+    /// replace the script. Closing that would mean handing the script to root
+    /// inline rather than as a file.
     private func makeWorkspace() throws -> Workspace {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("thumbprint-\(UUID().uuidString)", isDirectory: true)
@@ -251,6 +265,13 @@ final class BlockCloneEngine {
         DST=\(shellQuoted(targetRaw))
         PROGRESS=\(shellQuoted(workspace.progressLog.path))
         CANCEL=\(shellQuoted(workspace.cancelFlag.path))
+
+        # Cancel may have been pressed while the password prompt was up. Checked
+        # before dd starts, because a dd killed a second in has already
+        # overwritten the target's partition map.
+        if [ -f "$CANCEL" ]; then
+            exit 130
+        fi
 
         dd if="$SRC" of="$DST" bs=8m 2>"$PROGRESS" &
         pid=$!

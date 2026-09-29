@@ -27,7 +27,8 @@ final class UpdateController {
         case working(String)
         /// Installed and about to relaunch.
         case installed(UpdateRelease)
-        /// Verified but not installable here — left in ~/Downloads instead.
+        /// Not installable here, so the DMG is left in ~/Downloads instead —
+        /// unverified: nothing is checked on this path, because nothing is run.
         case downloaded(path: String, reason: String)
         case failed(String)
     }

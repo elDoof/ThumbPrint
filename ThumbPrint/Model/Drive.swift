@@ -42,6 +42,44 @@ struct Drive: Identifiable, Hashable {
 }
 
 extension Drive {
+    /// Whether `current` — what is mounted at this drive's path *right now* — is
+    /// still the same volume on the same physical disk.
+    ///
+    /// BSD names are handed out by macOS on attach and reused as soon as they're
+    /// free, so `disk4` at preflight and `disk4` a minute later can be two
+    /// different sticks. Anything that is about to act on a whole disk — an
+    /// erase, a raw clone — re-reads the drive and asks this first. The volume
+    /// UUID is what tells two sticks with the same name and number apart.
+    func isSameDisk(as current: Drive?) -> Bool {
+        guard let current, let bsdName = wholeDiskBSDName else { return false }
+        return current.wholeDiskBSDName == bsdName && current.volumeUUID == volumeUUID
+    }
+
+    /// The same drive with its capacity re-read from the volume.
+    ///
+    /// A `Drive` is a snapshot taken when the volume was scanned, and a DJ drive
+    /// routinely changes after that — plugged in, exported to from rekordbox,
+    /// *then* backed up. Analysis runs on these figures, not the snapshot, so the
+    /// free-space and cross-linked-cluster checks describe the drive as it is.
+    /// Falls back to the snapshot if the volume can't be read; the copy's own
+    /// mount checks will say so more usefully than this could.
+    func refreshingCapacity() -> Drive {
+        let keys: Set<URLResourceKey> = [.volumeTotalCapacityKey, .volumeAvailableCapacityKey]
+        guard let values = try? volumeURL.resourceValues(forKeys: keys) else { return self }
+        return Drive(
+            volumeURL: volumeURL,
+            name: name,
+            wholeDiskBSDName: wholeDiskBSDName,
+            totalCapacity: values.volumeTotalCapacity.map(Int64.init) ?? totalCapacity,
+            availableCapacity: values.volumeAvailableCapacity.map(Int64.init) ?? availableCapacity,
+            volumeUUID: volumeUUID,
+            formatDescription: formatDescription,
+            isReadOnly: isReadOnly
+        )
+    }
+}
+
+extension Drive {
     static func == (lhs: Drive, rhs: Drive) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }

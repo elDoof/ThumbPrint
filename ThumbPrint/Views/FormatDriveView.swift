@@ -194,8 +194,9 @@ struct FormatDriveView: View {
                     .keyboardShortcut(.cancelAction)
                     .controlSize(.large)
 
+                // No Return shortcut: the name field has focus, and finishing
+                // typing a name must not be what erases a disk.
                 Button("Erase", action: erase)
-                    .keyboardShortcut(.defaultAction)
                     .controlSize(.large)
                     .disabled(approval == nil)
 

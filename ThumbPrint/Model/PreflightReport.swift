@@ -58,7 +58,8 @@ extension PreflightReport {
         sourceIndex: FileIndex,
         targetIndex: FileIndex,
         filesystemCheck: FilesystemCheck.Report,
-        image: ImagePreflight.Facts? = nil
+        image: ImagePreflight.Facts? = nil,
+        tooLargeForTarget: [FileIndex.Entry] = []
     ) -> PreflightReport {
         var report = PreflightReport(mode: .fastSync, source: source, target: target)
 
@@ -190,7 +191,19 @@ extension PreflightReport {
 
         if !target.isFATFamily {
             report.warnings.append(
-                "“\(target.name)” is \(target.formatDescription). DJ players generally expect exFAT — the copy will work, but the drive may not be readable by a CDJ."
+                "“\(target.name)” is \(target.formatDescription). DJ players read FAT32, and only the newest read exFAT — the copy will work, but the drive may not be readable by a CDJ."
+            )
+        }
+
+        // Already removed from the plan by `SyncPlan.removeFilesTooLarge`, so
+        // the figures above don't count them. A warning rather than a blocker:
+        // refusing would leave the user with no backup of the rest either.
+        if !tooLargeForTarget.isEmpty {
+            let count = tooLargeForTarget.count
+            let names = tooLargeForTarget.prefix(3).map { ($0.relativePath as NSString).lastPathComponent }
+            let more = count > 3 ? ", and \(count - 3) more" : ""
+            report.warnings.append(
+                "\(count) file\(count == 1 ? " is" : "s are") larger than 4 GB, which a FAT32 drive can't store, and won't be copied: \(names.joined(separator: ", "))\(more). Erase “\(target.name)” as exFAT if you need \(count == 1 ? "it" : "them") on the backup."
             )
         }
 
@@ -230,6 +243,15 @@ extension PreflightReport {
 
         if source.id == target.id {
             report.blockers.append("The source and the backup drive are the same volume.")
+            return report
+        }
+
+        // Two partitions of one stick are two volumes but one disk, and a raw
+        // clone works on disks: `dd` would read and write the same device.
+        if let sourceBSD = source.wholeDiskBSDName, sourceBSD == target.wholeDiskBSDName {
+            report.blockers.append(
+                "“\(source.name)” and “\(target.name)” are two partitions of the same physical drive. An Exact Clone copies a whole disk, so it would overwrite the source. Use Fast Sync, or back up to a separate drive."
+            )
             return report
         }
 

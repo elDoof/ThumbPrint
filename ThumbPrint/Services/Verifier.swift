@@ -53,7 +53,20 @@ enum Verifier {
 
         // Paths already reported as skipped during the copy shouldn't be
         // counted twice — they're surfaced under their own heading.
-        let skippedPaths = Set(skipped.map { $0.components(separatedBy: " — ").first ?? $0 })
+        //
+        // Every " — " in a line is a candidate end of its path, not just the
+        // first: "Artist — Title.mp3 — Permission denied" names a track whose
+        // own name contains the separator, and splitting on the first would
+        // report it as missing as well as skipped.
+        var skippedPaths = Set<String>()
+        for line in skipped {
+            skippedPaths.insert(line)
+            var searchStart = line.startIndex
+            while let range = line.range(of: " — ", range: searchStart..<line.endIndex) {
+                skippedPaths.insert(String(line[..<range.lowerBound]))
+                searchStart = range.upperBound
+            }
+        }
 
         for entry in sourceIndex.fileEntries {
             if isCancelled() { throw CancellationError() }

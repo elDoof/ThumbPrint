@@ -149,7 +149,9 @@ struct SummaryView: View {
                 if verification.passed && summary.skipped.isEmpty {
                     NoticeBox(
                         kind: .success,
-                        text: "Verified — all \(verification.sourceFileCount) files are present on the backup with matching sizes and dates."
+                        text: verification.sourceFileCount == 1
+                            ? "Verified — the one file is present on the backup with a matching size and date."
+                            : "Verified — all \(verification.sourceFileCount) files are present on the backup with matching sizes and dates."
                     )
                 } else if !verification.passed {
                     NoticeBox(

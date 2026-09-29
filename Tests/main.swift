@@ -750,17 +750,51 @@ do {
           !DriveFormatter.partitions(onWholeDisk: eraseBSD).isEmpty)
 
     // `DiskImageStore.drive(for:)` deliberately reports no whole-disk name, so
-    // the drive is rebuilt here with the one the attachment gave us.
-    let eraseSubject = Drive(
-        volumeURL: eraseAttachment.mountPoint,
+    // the drive is read the way the erase itself re-reads it just before it
+    // runs — which also proves that lookup against a real attached disk.
+    guard let eraseSubject = DriveFormatter.currentDrive(atVolumePath: eraseAttachment.mountPoint.path) else {
+        print("harness error: couldn't read the throwaway disk back from its mount point")
+        exit(2)
+    }
+    check("the drive at the mount point is read back on the attached disk",
+          eraseSubject.wholeDiskBSDName == eraseBSD, "\(eraseSubject.wholeDiskBSDName ?? "nil") vs \(eraseBSD)")
+    check("with a volume UUID to tell it apart from the next stick", eraseSubject.volumeUUID != nil)
+    check("a plain folder is not mistaken for a mounted drive",
+          DriveFormatter.currentDrive(atVolumePath: imagesDir.path) == nil)
+    check("a path with nothing at it reads as no drive",
+          DriveFormatter.currentDrive(atVolumePath: "/Volumes/TP-NOT-PLUGGED-IN") == nil)
+
+    // The stick-swap case, made safe: an approval granted for a different volume
+    // on the same disk number. The erase must refuse before diskutil runs, which
+    // the surviving file proves.
+    let swappedStick = Drive(
+        volumeURL: eraseSubject.volumeURL,
         name: "TPBEFORE",
         wholeDiskBSDName: eraseBSD,
-        totalCapacity: 300 * 1024 * 1024,
-        availableCapacity: 290 * 1024 * 1024,
-        volumeUUID: nil,
+        totalCapacity: eraseSubject.totalCapacity,
+        availableCapacity: eraseSubject.availableCapacity,
+        volumeUUID: "00000000-0000-0000-0000-000000000000",
         formatDescription: "ExFAT",
         isReadOnly: false
     )
+    if let staleApproval = FormatPreflight.approve(eraseFacts(
+        drive: swappedStick,
+        format: .fat32,
+        name: "TPWRONG",
+        diskSize: DriveFormatter.wholeDiskSize(bsdName: eraseBSD),
+        siblings: DriveFormatter.partitions(onWholeDisk: eraseBSD),
+        sourcePath: srcPath,
+        sourceDisk: nil
+    )) {
+        var refusal: Error?
+        do { try DriveFormatter.erase(staleApproval) } catch { refusal = error }
+        check("an approval for a different volume on the same disk number is refused",
+              (refusal as? DriveFormatter.Failure) == .driveChanged("TPBEFORE"), "\(String(describing: refusal))")
+        check("and nothing was erased",
+              FileManager.default.fileExists(atPath: eraseAttachment.mountPoint.appendingPathComponent("Track.mp3").path))
+    } else {
+        check("the swapped-stick approval could be minted for the refusal test", false)
+    }
 
     guard let realApproval = FormatPreflight.approve(eraseFacts(
         drive: eraseSubject,
@@ -907,6 +941,150 @@ do {
     check("an unwritable location is not replaced in place",
           UpdateInstaller.destination(for: URL(fileURLWithPath: "/System/Applications/ThumbPrint.app"))
               == .revealOnly("ThumbPrint is installed somewhere this app can't write to (/System/Applications)."))
+
+
+    // =========================================================================
+    print("\n=== Q. 1.3 safety and robustness rules ===")
+    // =========================================================================
+
+    // Disk identity: the rule both the erase and the raw clone stand on.
+    let picked = Drive(
+        volumeURL: URL(fileURLWithPath: "/Volumes/BACKUPDJ"), name: "BACKUPDJ", wholeDiskBSDName: "disk4",
+        totalCapacity: 1, availableCapacity: 1, volumeUUID: "AAAA", formatDescription: "MS-DOS (FAT32)", isReadOnly: false
+    )
+    func variant(bsd: String?, uuid: String?) -> Drive {
+        Drive(volumeURL: picked.volumeURL, name: picked.name, wholeDiskBSDName: bsd,
+              totalCapacity: 9, availableCapacity: 9, volumeUUID: uuid, formatDescription: picked.formatDescription, isReadOnly: false)
+    }
+    check("the same volume on the same disk is the same disk", picked.isSameDisk(as: variant(bsd: "disk4", uuid: "AAAA")))
+    check("a different stick that inherited disk4 is not", !picked.isSameDisk(as: variant(bsd: "disk4", uuid: "BBBB")))
+    check("the same volume now on another disk number is not", !picked.isSameDisk(as: variant(bsd: "disk5", uuid: "AAAA")))
+    check("nothing mounted there is not", !picked.isSameDisk(as: nil))
+    check("a drive with no disk device never matches", !variant(bsd: nil, uuid: "AAAA").isSameDisk(as: variant(bsd: nil, uuid: "AAAA")))
+
+    // Two partitions of one stick: different volumes, one disk.
+    let partitionA = Drive(volumeURL: URL(fileURLWithPath: "/Volumes/A"), name: "A", wholeDiskBSDName: "disk99",
+                           totalCapacity: 1, availableCapacity: 1, volumeUUID: "A", formatDescription: "ExFAT", isReadOnly: false)
+    let partitionB = Drive(volumeURL: URL(fileURLWithPath: "/Volumes/B"), name: "B", wholeDiskBSDName: "disk99",
+                           totalCapacity: 1, availableCapacity: 1, volumeUUID: "B", formatDescription: "ExFAT", isReadOnly: false)
+    let sameDiskClone = PreflightReport.exactClone(
+        source: partitionA, target: partitionB, filesystemCheck: FilesystemCheck.Report(outcome: .passed)
+    )
+    check("an Exact Clone between two partitions of one disk is blocked",
+          !sameDiskClone.canProceed && sameDiskClone.blockers.contains { $0.contains("same physical drive") },
+          sameDiskClone.blockers.joined(separator: " | "))
+
+    // Stale capacity: the picker's snapshot is replaced by the volume's own figures.
+    let refreshed = makeDrive(dstPath, name: "TP-DST").refreshingCapacity()
+    let realTotal = Int64((try? URL(fileURLWithPath: dstPath).resourceValues(forKeys: [.volumeTotalCapacityKey]))?.volumeTotalCapacity ?? -1)
+    check("capacity is re-read from the volume, not the snapshot",
+          refreshed.totalCapacity == realTotal && refreshed.totalCapacity != 200_000_000,
+          "\(refreshed.totalCapacity) vs \(realTotal)")
+
+    // FAT32's 4 GB ceiling.
+    let bigFile = FileIndex.Entry(relativePath: "Video/Set.mov", size: 5_000_000_000,
+                                  modificationDate: Date(), isDirectory: false, isSymbolicLink: false)
+    let smallFile = FileIndex.Entry(relativePath: "Contents/Track.mp3", size: 9_000_000,
+                                    modificationDate: Date(), isDirectory: false, isSymbolicLink: false)
+    let edgeFile = FileIndex.Entry(relativePath: "Contents/Edge.wav", size: SyncPlan.fat32MaximumFileSize,
+                                   modificationDate: Date(), isDirectory: false, isSymbolicLink: false)
+    var fatPlan = SyncPlan(filesToCopy: [edgeFile, smallFile, bigFile])
+    let removed = fatPlan.removeFilesTooLarge(forTargetFormat: "MS-DOS (FAT32)")
+    check("a file over 4 GB is taken out of a plan for a FAT32 target", removed == [bigFile], "\(removed.map(\.relativePath))")
+    check("a file of exactly the FAT32 maximum stays in", fatPlan.filesToCopy.contains(edgeFile))
+    check("and the byte count no longer includes it", fatPlan.bytesToCopy == smallFile.size + edgeFile.size)
+    var exfatPlan = SyncPlan(filesToCopy: [bigFile])
+    check("an exFAT target keeps it", exfatPlan.removeFilesTooLarge(forTargetFormat: "ExFAT").isEmpty && exfatPlan.filesToCopy == [bigFile])
+    let tooLargeReport = PreflightReport.fastSync(
+        source: srcDrive, target: dstDrive, plan: fatPlan, sourceIndex: srcIndex, targetIndex: dstIndex,
+        filesystemCheck: FilesystemCheck.Report(outcome: .passed), tooLargeForTarget: removed
+    )
+    check("preflight names the file that won't be copied",
+          tooLargeReport.warnings.contains { $0.contains("larger than 4 GB") && $0.contains("Set.mov") },
+          tooLargeReport.warnings.joined(separator: " | "))
+    check("and doesn't block the rest of the backup",
+          !tooLargeReport.blockers.contains { $0.contains("4 GB") })
+    check("preflight no longer tells a DJ that players expect exFAT",
+          !tooLargeReport.warnings.contains { $0.contains("generally expect exFAT") })
+
+    // Fixtures for the engine checks, on APFS: these are about the engine's
+    // logic, not a filesystem's behaviour.
+    let fm = FileManager.default
+    let q = imagesDir.appendingPathComponent("q", isDirectory: true)
+    let qSrc = q.appendingPathComponent("src", isDirectory: true)
+    let qDst = q.appendingPathComponent("dst", isDirectory: true)
+    try fm.createDirectory(at: qSrc.appendingPathComponent("Crate"), withIntermediateDirectories: true)
+    try fm.createDirectory(at: qDst, withIntermediateDirectories: true)
+    try Data("trk".utf8).write(to: qSrc.appendingPathComponent("Crate/Track.mp3"))
+    // The backup has a *file* where the source now has a folder.
+    try Data("stale".utf8).write(to: qDst.appendingPathComponent("Crate"))
+
+    let qSource = makeDrive(qSrc.path, name: "Q-SRC")
+    let qTarget = makeDrive(qDst.path, name: "Q-DST")
+    let qEngine = FileSyncEngine { _ in }
+    let (qPlan, qSourceIndex, _) = try qEngine.makePlan(source: qSource, target: qTarget)
+    var conflictError: Error?
+    var conflictResult: FileSyncEngine.Result?
+    do {
+        conflictResult = try qEngine.execute(plan: qPlan, source: qSource, target: qTarget, sourceIndex: qSourceIndex)
+    } catch { conflictError = error }
+    var qIsDirectory: ObjCBool = false
+    check("a folder on the source replaces a same-named file on the backup",
+          conflictError == nil
+              && fm.fileExists(atPath: qDst.appendingPathComponent("Crate").path, isDirectory: &qIsDirectory)
+              && qIsDirectory.boolValue,
+          "\(String(describing: conflictError))")
+    check("and the track inside it is copied",
+          conflictResult?.filesCopied == 1 && conflictResult?.skipped.isEmpty == true,
+          "\(String(describing: conflictResult))")
+
+    // A track whose own name contains the " — " separator.
+    let dashName = "Artist — Title.mp3"
+    let dashIndex = try FileIndex.build(at: qSrc)
+    try Data("x".utf8).write(to: qSrc.appendingPathComponent(dashName))
+    let dashSourceIndex = try FileIndex.build(at: qSrc)
+    let dashVerification = try Verifier.verify(
+        sourceIndex: dashSourceIndex, targetVolume: qDst,
+        skipped: ["\(dashName) — Permission denied"]
+    )
+    check("a skipped track with \" — \" in its name isn't also reported missing",
+          !dashVerification.missing.contains(dashName) && dashSourceIndex.fileCount == dashIndex.fileCount + 1,
+          "missing: \(dashVerification.missing)")
+
+    // Out of space: recognised in every shape it arrives in…
+    check("a Cocoa out-of-space error is recognised",
+          FileSyncEngine.isOutOfSpace(NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)))
+    check("a POSIX ENOSPC is recognised",
+          FileSyncEngine.isOutOfSpace(NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))))
+    check("a wrapped ENOSPC is recognised",
+          FileSyncEngine.isOutOfSpace(NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError,
+                                               userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))])))
+    check("a permissions error is not", !FileSyncEngine.isOutOfSpace(NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES))))
+
+    // …and against a real full volume: the run stops with one clear error
+    // instead of skipping every remaining track.
+    let tinyImage = try DiskImageStore.create(
+        at: imagesDir.appendingPathComponent("tiny.sparseimage"),
+        sizeBytes: 16 * 1024 * 1024, filesystem: "ExFAT", volumeName: "TPTINY"
+    )
+    let tinyAttachment = try DiskImageStore.attach(tinyImage, readOnly: false, mountPoint: try DiskImageStore.makeMountPoint())
+    let tinyTarget = try DiskImageStore.drive(for: tinyAttachment)
+    let fullSrc = q.appendingPathComponent("full", isDirectory: true)
+    try fm.createDirectory(at: fullSrc, withIntermediateDirectories: true)
+    for n in 1...4 {
+        try Data(count: 6 * 1024 * 1024).write(to: fullSrc.appendingPathComponent("Track \(n).wav"))
+    }
+    let fullSource = makeDrive(fullSrc.path, name: "Q-FULL")
+    let (fullPlan, fullIndex, _) = try qEngine.makePlan(source: fullSource, target: tinyTarget)
+    var fullError: Error?
+    do { _ = try qEngine.execute(plan: fullPlan, source: fullSource, target: tinyTarget, sourceIndex: fullIndex) }
+    catch { fullError = error }
+    if case .outOfSpace? = fullError as? CloneError {
+        check("a full backup drive stops the run with an out-of-space error", true)
+    } else {
+        check("a full backup drive stops the run with an out-of-space error", false, "\(String(describing: fullError))")
+    }
+    _ = DiskImageStore.detach(tinyAttachment)
 
     print(failures == 0 ? "\nALL CHECKS PASSED" : "\n\(failures) CHECK(S) FAILED")
     exit(failures == 0 ? 0 : 1)
