@@ -280,10 +280,22 @@ final class FileSyncEngine {
                 try output.synchronize()
             }
 
-            if fm.fileExists(atPath: to.path) {
+            // rename(2) replaces an existing file in one step, so there is no
+            // moment where the backup holds neither the old track nor the new
+            // one — a drive pulled between a delete and a move used to lose the
+            // track until the next run. Measured 2026-10-26 on FAT32 and exFAT:
+            // the old content is replaced, and a target differing only in case
+            // takes the new name, as the delete-then-move did. A folder in the
+            // way can't be renamed over, so that one case is still cleared first.
+            var isDirectory: ObjCBool = false
+            if fm.fileExists(atPath: to.path, isDirectory: &isDirectory), isDirectory.boolValue {
                 try fm.removeItem(at: to)
             }
-            try fm.moveItem(at: temp, to: to)
+            guard rename(temp.path, to.path) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [
+                    NSFilePathErrorKey: to.path,
+                ])
+            }
 
             // Stamp the source's mtime so the next run's diff sees a match.
             // Without this every file looks changed and Fast Sync stops being fast.

@@ -135,22 +135,26 @@ final class BlockCloneEngine {
     // MARK: - Privileged copy
 
     private struct Workspace {
+        /// User-owned, 0700. Holds only the cancel flag.
         let directory: URL
-        let script: URL
-        let progressLog: URL
         let cancelFlag: URL
+        /// Created by the root script itself; see `privilegedScript`.
+        let runDirectory: URL
+        var progressLog: URL { runDirectory.appendingPathComponent("progress.log") }
     }
 
-    /// Creates a private, user-only directory for the helper script.
-    ///
-    /// SECURITY: the script here is executed as root, so its directory is 0700
-    /// and the script itself 0500. Never relax these, and never place it
-    /// somewhere world-writable such as /tmp — a writable path would let
-    /// another user's process swap the script's contents between creation and
-    /// execution and get root. The modes guard against *other users* only: a
-    /// process already running as this user owns the directory and could still
-    /// replace the script. Closing that would mean handing the script to root
-    /// inline rather than as a file.
+    /// Where root keeps its progress log. Only root can create entries here, so
+    /// nothing running as the user can put a file — or a symlink — in the way.
+    static let privilegedRunRoot = URL(fileURLWithPath: "/var/run", isDirectory: true)
+
+    /// SECURITY: the script runs as root, so **nothing root reads or writes may
+    /// live somewhere the user can change.** The script is handed to root inline
+    /// rather than as a file, and its log lives in a directory root creates,
+    /// because a 0700 user-owned directory stops other users but not a process
+    /// already running as this one: it could have swapped the script between
+    /// write and run, or replaced `progress.log` with a symlink to a system file
+    /// for root's `2>` to overwrite. The cancel flag is the one exception, and
+    /// safe: root only tests whether it exists.
     private func makeWorkspace() throws -> Workspace {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("thumbprint-\(UUID().uuidString)", isDirectory: true)
@@ -163,9 +167,9 @@ final class BlockCloneEngine {
 
         return Workspace(
             directory: directory,
-            script: directory.appendingPathComponent("clone.sh"),
-            progressLog: directory.appendingPathComponent("progress.log"),
-            cancelFlag: directory.appendingPathComponent("cancel")
+            cancelFlag: directory.appendingPathComponent("cancel"),
+            runDirectory: Self.privilegedRunRoot
+                .appendingPathComponent("thumbprint-\(UUID().uuidString)", isDirectory: true)
         )
     }
 
@@ -175,20 +179,24 @@ final class BlockCloneEngine {
         totalBytes: Int64,
         workspace: Workspace
     ) throws -> Int64 {
-        try writeScript(from: sourceRaw, to: targetRaw, workspace: workspace)
+        let script = Self.privilegedScript(
+            source: sourceRaw,
+            target: targetRaw,
+            runDirectory: workspace.runDirectory,
+            cancelFlag: workspace.cancelFlag
+        )
 
         // `do shell script` buffers output and returns only at completion, so
         // stdout can't be streamed. The script therefore reports its own
-        // progress into a file that this side tails.
-        let command = "/bin/sh \(shellQuoted(workspace.script.path))"
-        let appleScript = "do shell script \(appleScriptQuoted(command)) with administrator privileges"
-
+        // progress into a file that this side tails, and hands back the end of
+        // that log on stdout once it has finished and removed it.
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", appleScript]
+        process.arguments = ["-e", Self.appleScript(running: script, privileged: true)]
         let errorPipe = Pipe()
         process.standardError = errorPipe
-        process.standardOutput = Pipe()
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
 
         do {
             try process.run()
@@ -223,7 +231,15 @@ final class BlockCloneEngine {
 
         process.waitUntilExit()
 
-        if let bytes = readBytesTransferred(from: workspace.progressLog) {
+        // The run directory is gone by now; what the script printed is the end
+        // of its log. Small by construction (`tail`), so it can't have filled
+        // the pipe while the loop above wasn't reading it.
+        let finalLog = String(
+            data: outputPipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+
+        if let bytes = Self.bytesTransferred(in: finalLog) {
             bytesCopied = max(bytesCopied, bytes)
         }
 
@@ -241,36 +257,71 @@ final class BlockCloneEngine {
             }
             throw CloneError.rawCopyFailed(
                 exitCode: process.terminationStatus,
-                message: ddDiagnostics(from: workspace.progressLog, fallback: errorText)
+                message: Self.ddDiagnostics(in: finalLog, fallback: errorText)
             )
         }
 
-        if let scriptExit = readScriptExitCode(from: workspace.progressLog), scriptExit != 0 {
+        // The script always exits 0 and reports dd's status in its log, so a
+        // run that printed no status didn't get as far as dd finishing.
+        guard let scriptExit = Self.scriptExitCode(in: finalLog) else {
+            throw CloneError.rawCopyFailed(
+                exitCode: -1,
+                message: "The clone helper ended without reporting a result."
+            )
+        }
+        if scriptExit != 0 {
             throw CloneError.rawCopyFailed(
                 exitCode: scriptExit,
-                message: ddDiagnostics(from: workspace.progressLog, fallback: "")
+                message: Self.ddDiagnostics(in: finalLog, fallback: "")
             )
         }
 
         return bytesCopied
     }
 
-    private func writeScript(from sourceRaw: String, to targetRaw: String, workspace: Workspace) throws {
+    /// The script root runs. Static and parameterized by directory so
+    /// `Tests/run.sh` can run it unprivileged against two plain files.
+    ///
+    /// It always exits 0 and reports dd's status as `thumbprint-exit:N` on
+    /// stdout, because `do shell script` throws away stdout when the shell exits
+    /// non-zero — and stdout is the only way the end of the log gets back once
+    /// the run directory has been removed.
+    static func privilegedScript(
+        source: String,
+        target: String,
+        runDirectory: URL,
+        cancelFlag: URL
+    ) -> String {
         // BSD dd has no `status=progress`, but it does dump a transfer count to
         // stderr on SIGINFO. Both the loop and dd run as root here, so the
         // signal goes through.
-        let script = """
-        #!/bin/sh
-        SRC=\(shellQuoted(sourceRaw))
-        DST=\(shellQuoted(targetRaw))
-        PROGRESS=\(shellQuoted(workspace.progressLog.path))
-        CANCEL=\(shellQuoted(workspace.cancelFlag.path))
+        """
+        SRC=\(shellQuoted(source))
+        DST=\(shellQuoted(target))
+        RUN=\(shellQuoted(runDirectory.path))
+        CANCEL=\(shellQuoted(cancelFlag.path))
+
+        # mkdir fails if anything already exists at RUN, so the log below is
+        # always a fresh file in a directory only root can write to.
+        if ! mkdir -m 755 "$RUN"; then
+            echo "Couldn't create the clone helper's working folder."
+            echo "thumbprint-exit:70"
+            exit 0
+        fi
+        PROGRESS="$RUN/progress.log"
+
+        finish() {
+            echo "thumbprint-exit:$1" >> "$PROGRESS"
+            tail -n 20 "$PROGRESS"
+            rm -rf "$RUN"
+            exit 0
+        }
 
         # Cancel may have been pressed while the password prompt was up. Checked
         # before dd starts, because a dd killed a second in has already
         # overwritten the target's partition map.
         if [ -f "$CANCEL" ]; then
-            exit 130
+            finish 130
         fi
 
         dd if="$SRC" of="$DST" bs=8m 2>"$PROGRESS" &
@@ -286,23 +337,28 @@ final class BlockCloneEngine {
         done
 
         wait "$pid"
-        status=$?
-        echo "thumbprint-exit:$status" >> "$PROGRESS"
-        exit $status
+        finish $?
         """
+    }
 
-        try script.write(to: workspace.script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o500],
-            ofItemAtPath: workspace.script.path
-        )
+    /// `do shell script` with the script passed inline to `/bin/sh -c`. Without
+    /// `without altering line endings` the result comes back with CRs, which
+    /// the log parsing below would not split on.
+    static func appleScript(running script: String, privileged: Bool) -> String {
+        let command = "/bin/sh -c \(shellQuoted(script))"
+        return "do shell script \(appleScriptQuoted(command))"
+            + (privileged ? " with administrator privileges" : "")
+            + " without altering line endings"
     }
 
     // MARK: - Progress parsing
 
     private func readBytesTransferred(from log: URL) -> Int64? {
         guard let text = try? String(contentsOf: log, encoding: .utf8) else { return nil }
+        return Self.bytesTransferred(in: text)
+    }
 
+    static func bytesTransferred(in text: String) -> Int64? {
         // dd emits e.g. "10485760 bytes transferred in 1.234567 secs (…)".
         var latest: Int64?
         for line in text.components(separatedBy: .newlines) {
@@ -314,16 +370,14 @@ final class BlockCloneEngine {
         return latest
     }
 
-    private func readScriptExitCode(from log: URL) -> Int32? {
-        guard let text = try? String(contentsOf: log, encoding: .utf8) else { return nil }
+    static func scriptExitCode(in text: String) -> Int32? {
         for line in text.components(separatedBy: .newlines) where line.hasPrefix("thumbprint-exit:") {
             return Int32(line.replacingOccurrences(of: "thumbprint-exit:", with: "").trimmingCharacters(in: .whitespaces))
         }
         return nil
     }
 
-    private func ddDiagnostics(from log: URL, fallback: String) -> String {
-        guard let text = try? String(contentsOf: log, encoding: .utf8) else { return fallback }
+    static func ddDiagnostics(in text: String, fallback: String) -> String {
         let interesting = text
             .components(separatedBy: .newlines)
             .filter { !$0.isEmpty && !$0.hasPrefix("thumbprint-exit:") && !$0.contains("records") }
@@ -373,14 +427,17 @@ final class BlockCloneEngine {
 
     // MARK: - Quoting
 
-    private func shellQuoted(_ value: String) -> String {
+    private static func shellQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    private func appleScriptQuoted(_ value: String) -> String {
+    /// The script is multi-line now that it travels inline, so newlines are
+    /// escaped too; AppleScript turns `\n` back into a linefeed.
+    private static func appleScriptQuoted(_ value: String) -> String {
         let escaped = value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
         return "\"\(escaped)\""
     }
 

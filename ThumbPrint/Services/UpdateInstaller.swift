@@ -50,6 +50,20 @@ enum UpdateInstaller {
             + "and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
     }
 
+    /// The requirement the downloaded disk image must satisfy before it is
+    /// attached at all.
+    ///
+    /// No identifier: `codesign` derives a disk image's identifier from its file
+    /// name, and the shipped images say `ThumbPrint-1`, so pinning one would pin
+    /// a naming accident. Apple's anchor plus the team is what keeps an image
+    /// from anyone else away from DiskImages; the bundle inside still has to pass
+    /// `codeRequirement`, identifier and all. Verified 2026-10-26: passes on the
+    /// shipped 1.1 and 1.3 images, fails on an unsigned image and on images from
+    /// other developers.
+    static var imageRequirement: String {
+        "anchor apple generic and certificate leaf[subject.OU] = \"\(teamIdentifier)\""
+    }
+
     // MARK: - Errors
 
     enum Failure: LocalizedError, Equatable {
@@ -256,6 +270,17 @@ enum UpdateInstaller {
             let isOurs = directory.lastPathComponent.hasPrefix("thumbprint-update-")
                 && directory.path.hasPrefix(NSTemporaryDirectory())
             if isOurs { try? FileManager.default.removeItem(at: directory) }
+        }
+
+        // Attaching is itself work done on the untrusted file — DiskImages parses
+        // it — so a substituted image is refused before it gets that far.
+        let imageSignature = run("/usr/bin/codesign", [
+            "--verify", "--strict",
+            "-R=\(imageRequirement)",
+            dmg.path,
+        ])
+        guard imageSignature.status == 0 else {
+            throw Failure.signatureRejected(imageSignature.errorText)
         }
 
         let mountPoint = URL(fileURLWithPath: NSTemporaryDirectory())

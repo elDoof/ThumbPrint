@@ -705,6 +705,12 @@ final class CloneJob {
         summary: CloneSummary,
         sourceIndex: FileIndex?
     ) {
+        // The one thing an Exact Clone does tell the registry: the source's
+        // UUID now names two drives, and it must stop treating them as one.
+        if summary.mode == .exactClone {
+            DriveRegistry.shared.noteExactClone(source: source)
+            return
+        }
         guard summary.mode == .fastSync else { return }
 
         // A run involving an image records only the drive's side, for the reason

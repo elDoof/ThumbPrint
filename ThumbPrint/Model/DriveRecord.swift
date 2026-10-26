@@ -30,6 +30,18 @@ struct DriveRecord: Codable, Equatable, Identifiable {
     /// The last completed copy this drive took part in, in either role.
     var lastSync: SyncRecord?
 
+    /// More than one drive carries this volume UUID — an Exact Clone copies the
+    /// FAT volume serial along with everything else, so source and clone become
+    /// indistinguishable to this registry. Once set, the record stops being
+    /// updated and the picker says so instead of showing history that may
+    /// belong to the other drive. Nothing on the disk tells the two apart
+    /// (dd copies the MBR signature too), so the flag is never cleared.
+    ///
+    /// Optional so a `drives.json` written before 1.4 still decodes.
+    var sharedIdentity: Bool?
+
+    var isShared: Bool { sharedIdentity == true }
+
     var id: String { volumeUUID }
 }
 

@@ -15,6 +15,12 @@ struct DrivePickerView: View {
     /// selection is dropped underneath the sheet while it works.
     @State private var driveToErase: Drive?
 
+    /// True while a chosen image file is being checked with `hdiutil`. Those
+    /// calls run off the main actor — a slow volume or a stuck
+    /// `diskimages-helper` would otherwise freeze the window — and the image
+    /// rows are disabled meanwhile so a second choice can't race the first.
+    @State private var isCheckingImage = false
+
     var body: some View {
         // The page scrolls; the footer does not.
         //
@@ -252,41 +258,44 @@ struct DrivePickerView: View {
     /// shows both "here's your image" and "pick an image" at the same time.
     @ViewBuilder
     private func imageRows(selection: Binding<Endpoint?>, role: SectionRole) -> some View {
-        if let url = selection.wrappedValue?.imageURL {
-            ImageFileRow(
-                title: url.lastPathComponent,
-                subtitle: imageSubtitle(for: url),
-                isSelected: true
-            ) {
-                // Tapping the chosen image clears it, so there's a way back to
-                // the drives without a separate control.
-                selection.wrappedValue = nil
-            }
-        } else {
-            if role == .to, !job.mode.isInspection {
+        Group {
+            if let url = selection.wrappedValue?.imageURL {
                 ImageFileRow(
-                    title: "New disk image…",
-                    subtitle: "Save this drive to a file you can restore later",
-                    systemImage: "plus.rectangle.on.folder",
-                    isPlaceholder: true
+                    title: url.lastPathComponent,
+                    subtitle: imageSubtitle(for: url),
+                    isSelected: true
                 ) {
-                    chooseNewImage(for: selection)
+                    // Tapping the chosen image clears it, so there's a way back to
+                    // the drives without a separate control.
+                    selection.wrappedValue = nil
+                }
+            } else {
+                if role == .to, !job.mode.isInspection {
+                    ImageFileRow(
+                        title: "New disk image…",
+                        subtitle: "Save this drive to a file you can restore later",
+                        systemImage: "plus.rectangle.on.folder",
+                        isPlaceholder: true
+                    ) {
+                        chooseNewImage(for: selection)
+                    }
+
+                    Divider().padding(.leading, 52)
                 }
 
-                Divider().padding(.leading, 52)
-            }
-
-            ImageFileRow(
-                title: role == .to ? "Existing disk image…" : "Disk image…",
-                subtitle: role == .to
-                    ? "Update an image you saved before"
-                    : "Restore from an image you saved before",
-                systemImage: "folder",
-                isPlaceholder: true
-            ) {
-                chooseExistingImage(for: selection)
+                ImageFileRow(
+                    title: role == .to ? "Existing disk image…" : "Disk image…",
+                    subtitle: role == .to
+                        ? "Update an image you saved before"
+                        : "Restore from an image you saved before",
+                    systemImage: "folder",
+                    isPlaceholder: true
+                ) {
+                    chooseExistingImage(for: selection)
+                }
             }
         }
+        .disabled(isCheckingImage)
     }
 
     /// The way in to the one destructive thing this app does that isn't a copy.
@@ -332,7 +341,8 @@ struct DrivePickerView: View {
         panel.isExtensionHidden = false
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        adopt(url: normalizedImageURL(url), into: selection)
+        let normalized = normalizedImageURL(url)
+        Task { await adopt(url: normalized, into: selection) }
     }
 
     private func chooseExistingImage(for selection: Binding<Endpoint?>) {
@@ -348,20 +358,26 @@ struct DrivePickerView: View {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        // A file that isn't a disk image can't become a preflight blocker — a
-        // `PreflightReport` needs two live volumes, and this is exactly the case
-        // where nothing ever gets attached. Refuse it here instead.
-        guard (try? DiskImageStore.info(for: url)) != nil else {
-            selectionError = "“\(url.lastPathComponent)” isn't a disk image ThumbPrint can read."
-            return
-        }
+        Task {
+            isCheckingImage = true
+            defer { isCheckingImage = false }
 
-        adopt(url: url, into: selection)
+            // A file that isn't a disk image can't become a preflight blocker — a
+            // `PreflightReport` needs two live volumes, and this is exactly the case
+            // where nothing ever gets attached. Refuse it here instead.
+            let readable = await Task.detached { (try? DiskImageStore.info(for: url)) != nil }.value
+            guard readable else {
+                selectionError = "“\(url.lastPathComponent)” isn't a disk image ThumbPrint can read."
+                return
+            }
+
+            await adopt(url: url, into: selection)
+        }
     }
 
     /// Applies the rules that can be decided from the path alone, before anything
     /// is created or attached.
-    private func adopt(url: URL, into selection: Binding<Endpoint?>) {
+    private func adopt(url: URL, into selection: Binding<Endpoint?>) async {
         let folder = url.deletingLastPathComponent()
         let hostFormat = (try? folder.resourceValues(forKeys: [.volumeLocalizedFormatDescriptionKey]))?
             .volumeLocalizedFormatDescription ?? ""
@@ -375,7 +391,10 @@ struct DrivePickerView: View {
             return
         }
 
-        if let open = DiskImageStore.attachment(for: url), open.mountPoint != nil {
+        isCheckingImage = true
+        defer { isCheckingImage = false }
+        let isOpen = await Task.detached { DiskImageStore.attachment(for: url)?.mountPoint != nil }.value
+        if isOpen {
             selectionError = "“\(url.lastPathComponent)” is already open. Eject it in Finder, then choose it again."
             return
         }
@@ -403,7 +422,15 @@ struct DrivePickerView: View {
     /// about to select anyway, and five drives each captioned with a non-fact is
     /// worse than five drives with none.
     private func history(for drive: Drive) -> String? {
-        guard let sync = registry.record(for: drive)?.lastSync else { return nil }
+        guard let record = registry.record(for: drive) else { return nil }
+
+        // Saying nothing would be quieter, but a drive that used to show its
+        // history and stopped deserves a reason.
+        if record.isShared {
+            return "Same identity as another drive (an exact clone) · history not tracked"
+        }
+
+        guard let sync = record.lastSync else { return nil }
 
         let when = AgeFormat.ago(sync.finishedAt)
         let subject = switch sync.role {

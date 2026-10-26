@@ -36,9 +36,14 @@ final class DriveRegistry {
     /// change: the file holds one small object per drive a person owns.
     func noteSeen(_ drives: [Drive]) {
         guard !drives.isEmpty else { return }
-        for drive in drives {
-            store.noteSeen(drive)
-        }
+        store.noteMounted(drives)
+        persist()
+    }
+
+    /// An Exact Clone succeeded, so the source's volume UUID now names two
+    /// drives. See `DriveRecord.sharedIdentity`.
+    func noteExactClone(source: Drive) {
+        store.noteSharedIdentity(source)
         persist()
     }
 

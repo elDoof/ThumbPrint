@@ -1086,6 +1086,154 @@ do {
     }
     _ = DiskImageStore.detach(tinyAttachment)
 
+    // =========================================================================
+    print("\n=== R. 1.4 hardening ===")
+    // =========================================================================
+
+    // The update image is checked before it's attached. The requirement can't
+    // pin an identifier (codesign names an image after its file), so what has
+    // to hold is that it still pins Apple's anchor and the team, and that an
+    // unsigned image fails it.
+    check("image requirement pins Apple's anchor",
+          UpdateInstaller.imageRequirement.contains("anchor apple generic"))
+    check("image requirement pins the team",
+          UpdateInstaller.imageRequirement.contains(UpdateInstaller.teamIdentifier))
+    let unsignedImage = imagesDir.appendingPathComponent("unsigned.dmg")
+    let makeUnsigned = Process()
+    makeUnsigned.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+    makeUnsigned.arguments = ["create", "-size", "1m", "-fs", "ExFAT", "-volname", "X", "-quiet", "-ov", unsignedImage.path]
+    try makeUnsigned.run(); makeUnsigned.waitUntilExit()
+    let verifyUnsigned = Process()
+    verifyUnsigned.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    verifyUnsigned.arguments = ["--verify", "--strict", "-R=\(UpdateInstaller.imageRequirement)", unsignedImage.path]
+    verifyUnsigned.standardError = Pipe()
+    try verifyUnsigned.run(); verifyUnsigned.waitUntilExit()
+    check("an unsigned image fails the image requirement", verifyUnsigned.terminationStatus != 0)
+
+    // A changed track replaces the old one by rename, on real exFAT; a folder
+    // standing where the source has a file is still cleared first.
+    let replaceImage = try DiskImageStore.create(
+        at: imagesDir.appendingPathComponent("replace.sparseimage"),
+        sizeBytes: 16 * 1024 * 1024, filesystem: "ExFAT", volumeName: "TPREPL"
+    )
+    let replaceAttachment = try DiskImageStore.attach(replaceImage, readOnly: false, mountPoint: try DiskImageStore.makeMountPoint())
+    let replaceTarget = try DiskImageStore.drive(for: replaceAttachment)
+    let replaceSrc = q.appendingPathComponent("replace", isDirectory: true)
+    try fm.createDirectory(at: replaceSrc, withIntermediateDirectories: true)
+    try "newer-content".write(to: replaceSrc.appendingPathComponent("Track.mp3"), atomically: false, encoding: .utf8)
+    try "a file now".write(to: replaceSrc.appendingPathComponent("Was A Folder.mp3"), atomically: false, encoding: .utf8)
+    try "old".write(to: replaceTarget.volumeURL.appendingPathComponent("Track.mp3"), atomically: false, encoding: .utf8)
+    try fm.createDirectory(at: replaceTarget.volumeURL.appendingPathComponent("Was A Folder.mp3"), withIntermediateDirectories: true)
+    let replaceSource = makeDrive(replaceSrc.path, name: "R-SRC")
+    let (replacePlan, replaceIndex, _) = try qEngine.makePlan(source: replaceSource, target: replaceTarget)
+    _ = try qEngine.execute(plan: replacePlan, source: replaceSource, target: replaceTarget, sourceIndex: replaceIndex)
+    check("a changed track is replaced in place on exFAT",
+          (try? String(contentsOf: replaceTarget.volumeURL.appendingPathComponent("Track.mp3"), encoding: .utf8)) == "newer-content")
+    check("a folder where the source has a file is replaced by the file",
+          (try? String(contentsOf: replaceTarget.volumeURL.appendingPathComponent("Was A Folder.mp3"), encoding: .utf8)) == "a file now")
+    let leftoverTemps = ((try? fm.contentsOfDirectory(atPath: replaceTarget.volumeURL.path)) ?? [])
+        .filter { $0.hasPrefix(FileSyncEngine.tempPrefix) }
+    check("no temp files are left behind", leftoverTemps.isEmpty, "found \(leftoverTemps)")
+    _ = DiskImageStore.detach(replaceAttachment)
+
+    // Exact Clone's root script, run as this user against two plain files. The
+    // paths carry a space and a quote, because the script now travels inline
+    // through two layers of quoting.
+    let clone = q.appendingPathComponent("clone it's", isDirectory: true)
+    try fm.createDirectory(at: clone, withIntermediateDirectories: true)
+    let cloneSrc = clone.appendingPathComponent("source disk")
+    let cloneDst = clone.appendingPathComponent("target disk")
+    var cloneBytes = Data(count: 3 * 1024 * 1024)
+    for i in stride(from: 0, to: cloneBytes.count, by: 4096) { cloneBytes[i] = UInt8(truncatingIfNeeded: i / 4096) }
+    try cloneBytes.write(to: cloneSrc)
+    try Data().write(to: cloneDst)
+    let cancelFlag = clone.appendingPathComponent("cancel")
+
+    func runCloneScript(runDirectory: URL) throws -> (status: Int32, output: String) {
+        let script = BlockCloneEngine.privilegedScript(
+            source: cloneSrc.path, target: cloneDst.path,
+            runDirectory: runDirectory, cancelFlag: cancelFlag
+        )
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", BlockCloneEngine.appleScript(running: script, privileged: false)]
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = Pipe()
+        try process.run()
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    let runDir = clone.appendingPathComponent("run")
+    let cloneRun = try runCloneScript(runDirectory: runDir)
+    check("the inline clone script runs through osascript", cloneRun.status == 0, cloneRun.output)
+    check("it reports dd's status on stdout", BlockCloneEngine.scriptExitCode(in: cloneRun.output) == 0, cloneRun.output)
+    check("the clone is byte-identical", (try? Data(contentsOf: cloneDst)) == cloneBytes)
+    check("the final log reports every byte",
+          BlockCloneEngine.bytesTransferred(in: cloneRun.output) == Int64(cloneBytes.count), cloneRun.output)
+    check("the script removes its run directory", !fm.fileExists(atPath: runDir.path))
+
+    // Something already at the run directory — the symlink case root must never
+    // write through — makes the script stop before dd, leaving it untouched.
+    let planted = clone.appendingPathComponent("planted")
+    try "do not overwrite".write(to: planted, atomically: false, encoding: .utf8)
+    try fm.createSymbolicLink(at: runDir, withDestinationURL: planted)
+    try Data().write(to: cloneDst)
+    let blockedRun = try runCloneScript(runDirectory: runDir)
+    check("an existing run directory stops the script", BlockCloneEngine.scriptExitCode(in: blockedRun.output) == 70, blockedRun.output)
+    check("the planted file is untouched",
+          (try? String(contentsOf: planted, encoding: .utf8)) == "do not overwrite")
+    check("dd never ran", (try? Data(contentsOf: cloneDst))?.isEmpty == true)
+    try fm.removeItem(at: runDir)
+
+    fm.createFile(atPath: cancelFlag.path, contents: nil)
+    let cancelledRun = try runCloneScript(runDirectory: runDir)
+    check("a cancel flag set before dd reports 130", BlockCloneEngine.scriptExitCode(in: cancelledRun.output) == 130, cancelledRun.output)
+    check("a cancelled run writes nothing", (try? Data(contentsOf: cloneDst))?.isEmpty == true)
+    check("a cancelled run removes its run directory", !fm.fileExists(atPath: runDir.path))
+
+    // Two drives, one UUID: the registry stops merging them.
+    let sharedUUID = "CCCCCCCC-0000-0000-0000-000000000003"
+    func uuidDrive(_ uuid: String, _ name: String) -> Drive {
+        Drive(volumeURL: URL(fileURLWithPath: "/Volumes/\(name)"), name: name, wholeDiskBSDName: nil,
+              totalCapacity: 1, availableCapacity: 1, volumeUUID: uuid, formatDescription: "MS-DOS (FAT32)", isReadOnly: false)
+    }
+    var clones = DriveRegistryStore()
+    clones.noteSeen(uuidDrive(sharedUUID, "HOTFIRE"), at: t0)
+    clones.noteMounted([uuidDrive(sharedUUID, "HOTFIRE"), uuidDrive(sharedUUID, "SPARE")], at: t1)
+    check("two mounted drives with one UUID are marked shared", clones.records[sharedUUID]?.isShared == true)
+    clones.noteSeen(uuidDrive(sharedUUID, "SPARE"), at: t1)
+    check("a shared record's name stops flipping", clones.records[sharedUUID]?.name == "HOTFIRE",
+          clones.records[sharedUUID]?.name ?? "nil")
+    clones.noteSync(source: uuidDrive(sharedUUID, "HOTFIRE"), target: uuidDrive(uuidA, "BACKUP"),
+                    filesCopied: 1, bytesCopied: 1, duration: 1, verified: true, sourceIndex: srcIndex, at: t1)
+    check("a shared record takes no sync history", clones.records[sharedUUID]?.lastSync == nil)
+    check("a shared record takes no content snapshot", clones.records[sharedUUID]?.contents == nil)
+    check("the other side of that sync is still recorded", clones.records[uuidA]?.lastSync?.role == .backup)
+
+    var exact = DriveRegistryStore()
+    exact.noteSharedIdentity(uuidDrive(uuidB, "GIG"), at: t0)
+    check("an Exact Clone marks the source shared, creating the record if needed",
+          exact.records[uuidB]?.isShared == true)
+    var sameUUIDSync = DriveRegistryStore()
+    sameUUIDSync.noteSync(source: uuidDrive(uuidB, "A"), target: uuidDrive(uuidB, "B"),
+                          filesCopied: 1, bytesCopied: 1, duration: 1, verified: true, at: t0)
+    check("a sync between two drives with one UUID records neither side",
+          sameUUIDSync.records[uuidB]?.isShared == true && sameUUIDSync.records[uuidB]?.lastSync == nil)
+
+    try clones.save(to: regURL)
+    check("the shared flag survives a save and reload",
+          DriveRegistryStore.load(from: regURL).records[sharedUUID]?.isShared == true)
+    var unshared = DriveRegistryStore()
+    unshared.noteSeen(uuidDrive(uuidA, "OLD"), at: t0)
+    try unshared.save(to: regURL)
+    let legacyJSON = try String(contentsOf: regURL, encoding: .utf8)
+    check("an unshared record writes no sharedIdentity key", !legacyJSON.contains("sharedIdentity"))
+    check("a drives.json without the key still loads",
+          DriveRegistryStore.load(from: regURL).records[uuidA]?.isShared == false)
+
     print(failures == 0 ? "\nALL CHECKS PASSED" : "\n\(failures) CHECK(S) FAILED")
     exit(failures == 0 ? 0 : 1)
 } catch {

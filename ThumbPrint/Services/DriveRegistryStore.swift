@@ -141,6 +141,35 @@ extension DriveRegistryStore {
 // MARK: - Recording
 
 extension DriveRegistryStore {
+    func isShared(_ uuid: String) -> Bool {
+        records[uuid]?.isShared == true
+    }
+
+    /// Everything currently mounted. Two volumes reporting one UUID is the
+    /// backstop for clones this app didn't make; `noteSharedIdentity` after an
+    /// Exact Clone is the case it knows for certain.
+    mutating func noteMounted(_ drives: [Drive], at now: Date = Date()) {
+        var seen: [String: Int] = [:]
+        for uuid in drives.compactMap(\.volumeUUID) { seen[uuid, default: 0] += 1 }
+
+        for drive in drives {
+            if let uuid = drive.volumeUUID, seen[uuid, default: 0] > 1 {
+                noteSharedIdentity(drive, at: now)
+            } else {
+                noteSeen(drive, at: now)
+            }
+        }
+    }
+
+    /// Marks a drive's UUID as belonging to more than one drive. Creates the
+    /// record if there isn't one, because the flag has to outlive this launch:
+    /// with only one of the two plugged in later, nothing else would say so.
+    mutating func noteSharedIdentity(_ drive: Drive, at now: Date = Date()) {
+        guard let uuid = drive.volumeUUID else { return }
+        noteSeen(drive, at: now)
+        records[uuid]?.sharedIdentity = true
+    }
+
     /// A drive was seen mounted. Refreshes the mutable facts about it.
     ///
     /// Drives with no readable volume UUID are ignored outright — see
@@ -148,7 +177,13 @@ extension DriveRegistryStore {
     mutating func noteSeen(_ drive: Drive, at now: Date = Date()) {
         guard let uuid = drive.volumeUUID else { return }
 
-        if var existing = records[uuid] {
+        if var existing = records[uuid], existing.isShared {
+            // Which of the drives this is can't be known, so nothing about it
+            // is taken as describing "the" drive — that's how the name used to
+            // flip between the two.
+            existing.lastSeen = now
+            records[uuid] = existing
+        } else if var existing = records[uuid] {
             existing.name = drive.name
             existing.formatDescription = drive.formatDescription
             existing.totalCapacity = drive.totalCapacity
@@ -174,7 +209,7 @@ extension DriveRegistryStore {
         at now: Date = Date()
     ) {
         noteSeen(drive, at: now)
-        guard let uuid = drive.volumeUUID else { return }
+        guard let uuid = drive.volumeUUID, !isShared(uuid) else { return }
         records[uuid]?.contents = ContentSnapshot(
             index: index,
             library: library ?? LibraryReport.evaluate(index: index)
@@ -201,10 +236,16 @@ extension DriveRegistryStore {
         sourceIndex: FileIndex? = nil,
         at now: Date = Date()
     ) {
+        // Two drives with one UUID can't each get a record of their own side.
+        if let uuid = source.volumeUUID, uuid == target.volumeUUID {
+            noteSharedIdentity(source, at: now)
+            return
+        }
+
         noteSeen(source, at: now)
         noteSeen(target, at: now)
 
-        if let uuid = source.volumeUUID {
+        if let uuid = source.volumeUUID, !isShared(uuid) {
             records[uuid]?.lastSync = SyncRecord(
                 finishedAt: now,
                 role: .source,
@@ -216,7 +257,7 @@ extension DriveRegistryStore {
             )
         }
 
-        if let uuid = target.volumeUUID {
+        if let uuid = target.volumeUUID, !isShared(uuid) {
             records[uuid]?.lastSync = SyncRecord(
                 finishedAt: now,
                 role: .backup,
@@ -230,10 +271,10 @@ extension DriveRegistryStore {
 
         guard let sourceIndex else { return }
         let library = LibraryReport.evaluate(index: sourceIndex)
-        if let uuid = source.volumeUUID {
+        if let uuid = source.volumeUUID, !isShared(uuid) {
             records[uuid]?.contents = ContentSnapshot(index: sourceIndex, library: library)
         }
-        if verified, let uuid = target.volumeUUID {
+        if verified, let uuid = target.volumeUUID, !isShared(uuid) {
             records[uuid]?.contents = ContentSnapshot(index: sourceIndex, library: library)
         }
     }
@@ -260,7 +301,7 @@ extension DriveRegistryStore {
         at now: Date = Date()
     ) {
         noteSeen(drive, at: now)
-        guard let uuid = drive.volumeUUID else { return }
+        guard let uuid = drive.volumeUUID, !isShared(uuid) else { return }
 
         records[uuid]?.lastSync = SyncRecord(
             finishedAt: now,
